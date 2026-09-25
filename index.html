@@ -11899,6 +11899,7 @@ body.printing-sheets #sheet-zone{display:block;}
   function load() {
     try {
       const raw = localStorage.getItem(STORE_KEY);
+      brutConnu = raw;
       if (raw) data = JSON.parse(raw);
     } catch (e) { /* stockage indisponible */ }
     if (!data || !Array.isArray(data.classes)) data = { classes: [], activeId: null };
@@ -11909,11 +11910,12 @@ body.printing-sheets #sheet-zone{display:block;}
     });
   }
 
-  let saveTimer = null;
+  let saveTimer = null, brutConnu = null;
   function save() {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
-      try { localStorage.setItem(STORE_KEY, JSON.stringify(data)); }
+      saveTimer = null;
+      try { const brut = JSON.stringify(data); localStorage.setItem(STORE_KEY, brut); brutConnu = brut; }
       catch (e) { toast("Sauvegarde impossible (stockage plein ou bloqué)"); }
     }, 180);
   }
@@ -12256,7 +12258,22 @@ body.printing-sheets #sheet-zone{display:block;}
     sel.onchange = () => { data.activeId = sel.value; save(); render(); };
   }
 
+  function resynchroniser() {
+    if (saveTimer) return false;          // une sauvegarde locale est en attente : elle prime
+    let brut = null;
+    try { brut = localStorage.getItem(STORE_KEY); } catch (e) { return false; }
+    if (!brut || brut === brutConnu) return false;
+    const actif = data.activeId;
+    load();
+    if (actif && data.classes.some(c => c.id === actif)) data.activeId = actif;
+    return true;
+  }
+  window.addEventListener("storage", (e) => { if (e.key === STORE_KEY && resynchroniser()) render(); });
+  window.addEventListener("focus", () => { if (resynchroniser()) render(); });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && resynchroniser()) render(); });
+
   function render() {
+    resynchroniser();
     renderNav();
     renderClasseSelect();
     const cl = classe();
@@ -12612,6 +12629,7 @@ body.printing-sheets #sheet-zone{display:block;}
         <button class="btn" id="fiche-prev" ${idx === 0 ? "disabled" : ""}>← Précédent</button>
         <button class="btn" id="fiche-next" ${idx === cl.eleves.length - 1 ? "disabled" : ""}>Suivant →</button>
         <span style="flex:1"></span>
+        <button class="btn" id="fiche-raz" ${eleveEvalue(el) ? "" : "disabled"}>🧹 Effacer le diagnostic de cet élève</button>
         <button class="btn btn-primary" id="fiche-print">🖨 Imprimer la fiche</button>
       </div>
 
@@ -12622,6 +12640,9 @@ body.printing-sheets #sheet-zone{display:block;}
         </div>
 
         <table class="fiche-id">
+          <tr>
+            <th>Élève :</th><td colspan="3"><b>${esc(el.nom)}</b></td>
+          </tr>
           <tr>
             <th>Classe :</th><td>${esc(cl.nom)}</td>
             <th>Date :</th><td><input class="fi" id="fi-date" type="date" value="${esc(en.date)}"></td>
@@ -12710,6 +12731,9 @@ body.printing-sheets #sheet-zone{display:block;}
     $("fiche-prev").onclick = () => { ficheEleveId = cl.eleves[idx - 1].id; render(); };
     $("fiche-next").onclick = () => { ficheEleveId = cl.eleves[idx + 1].id; render(); };
     $("fiche-print").onclick = () => { finPrintFeuilles(); window.print(); };
+    $("fiche-raz").onclick = () => confirmModal("Effacer le diagnostic", "Toutes les notes du diagnostic individuel de « " + el.nom + " » seront effacées. Continuer ?", "Effacer", () => {
+      el.scores = {}; save(); toast("Diagnostic de « " + el.nom + " » effacé"); render();
+    });
     $("fi-obs").oninput = () => { el.observations = $("fi-obs").value; save(); };
     $("fi-obj").oninput = () => { el.objectif = $("fi-obj").value; save(); };
     $("fi-date").onchange = () => { en.date = $("fi-date").value; save(); };
@@ -13827,11 +13851,271 @@ body.printing-sheets #sheet-zone{display:block;}
     return n ? sombre / n : 0;
   }
 
+
+  /* ---------- lecture d'une fiche imprimée SANS repères ----------
+     Repère les cases (bulles rondes ou cases carrées) d'un tableau, les range
+     en lignes de « nbCols » cases alignées, puis mesure le noircissement de
+     l'intérieur de chaque case (bulle remplie, croix, coche…).
+     forme : "rond" (fiche individuelle), "carre" (fiche collective) ou null. */
+  function lireGrilleCasesA(img, nbCols, forme, cible, sansRedresser) {
+    const sc = Math.max(0.2, Math.min(3, cible / img.width));
+    const w = Math.round(img.width * sc), h = Math.round(img.height * sc);
+    const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+    const cx0 = cv.getContext("2d"); cx0.imageSmoothingEnabled = true; cx0.imageSmoothingQuality = "high";
+    cx0.drawImage(img, 0, 0, w, h);
+    const d = cx0.getImageData(0, 0, w, h).data;
+    const g = new Float32Array(w * h);
+    for (let i = 0, j = 0; i < d.length; i += 4, j++) g[j] = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+
+    // seuillage adaptatif (moyenne locale) : résiste aux ombres et à l'éclairage inégal
+    const I = new Float64Array((w + 1) * (h + 1));
+    for (let y = 0; y < h; y++) {
+      let s = 0;
+      for (let x = 0; x < w; x++) { s += g[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + s; }
+    }
+    const R = Math.max(6, Math.round(w / 60));
+    const hist = new Array(256).fill(0);
+    for (let i = 0; i < g.length; i += 7) hist[Math.max(0, Math.min(255, g[i] | 0))]++;
+    let cum = 0, papier = 255; const tot = hist.reduce((a, b) => a + b, 0);
+    for (let v = 0; v < 256; v++) { cum += hist[v]; if (cum >= tot * 0.8) { papier = v; break; } }
+    const bin = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const y0 = Math.max(0, y - R), y1 = Math.min(h, y + R + 1);
+      for (let x = 0; x < w; x++) {
+        const x0 = Math.max(0, x - R), x1 = Math.min(w, x + R + 1);
+        const m = (I[y1 * (w + 1) + x1] - I[y0 * (w + 1) + x1] - I[y1 * (w + 1) + x0] + I[y0 * (w + 1) + x0]) / ((x1 - x0) * (y1 - y0));
+        const v = g[y * w + x];
+        bin[y * w + x] = ((v < m - 14 && v < 200) || v < papier * 0.62) ? 1 : 0;
+      }
+    }
+    const sombreDans = (x0, y0, x1, y1) => {
+      let n = 0, s = 0;
+      for (let y = Math.max(0, Math.round(y0)); y <= Math.min(h - 1, Math.round(y1)); y++)
+        for (let x = Math.max(0, Math.round(x0)); x <= Math.min(w - 1, Math.round(x1)); x++) { n++; s += bin[y * w + x]; }
+      return n ? s / n : 0;
+    };
+
+    // composantes connexes de taille et de forme compatibles avec une case
+    const vu = new Uint8Array(w * h);
+    const cands = [];
+    const dmin = w * 0.008, dmax = w * 0.06;
+    for (let yy = 0; yy < h; yy++) for (let xx = 0; xx < w; xx++) {
+      const i0 = yy * w + xx;
+      if (!bin[i0] || vu[i0]) continue;
+      let minx = xx, maxx = xx, miny = yy, maxy = yy, n = 0;
+      const pile = [i0]; vu[i0] = 1;
+      while (pile.length) {
+        const p = pile.pop(); n++;
+        const px = p % w, py = (p - px) / w;
+        if (px < minx) minx = px; if (px > maxx) maxx = px; if (py < miny) miny = py; if (py > maxy) maxy = py;
+        if (px + 1 < w && bin[p + 1] && !vu[p + 1]) { vu[p + 1] = 1; pile.push(p + 1); }
+        if (px > 0 && bin[p - 1] && !vu[p - 1]) { vu[p - 1] = 1; pile.push(p - 1); }
+        if (py + 1 < h && bin[p + w] && !vu[p + w]) { vu[p + w] = 1; pile.push(p + w); }
+        if (py > 0 && bin[p - w] && !vu[p - w]) { vu[p - w] = 1; pile.push(p - w); }
+      }
+      const bw = maxx - minx + 1, bh = maxy - miny + 1;
+      if (bw < dmin || bh < dmin || bw > dmax || bh > dmax) continue;
+      const ratio = bw / bh;
+      if (ratio < 0.72 || ratio > 1.38) continue;
+      if (n / (bw * bh) < 0.12) continue;
+      // forme : une case carrée a des coins occupés, une bulle ronde non
+      const cw = Math.max(1, bw * 0.15), ch = Math.max(1, bh * 0.15);
+      const coins = (sombreDans(minx, miny, minx + cw, miny + ch) + sombreDans(maxx - cw, miny, maxx, miny + ch) +
+                     sombreDans(minx, maxy - ch, minx + cw, maxy) + sombreDans(maxx - cw, maxy - ch, maxx, maxy)) / 4;
+      const rond = coins < 0.3;
+      if (forme === "rond" && !rond) continue;
+      if (forme === "carre") {
+        if (rond) continue;
+        // une case a 4 côtés : bord sombre sur la majeure partie de chaque côté (les chiffres non)
+        const ep = Math.max(1, Math.round(Math.min(bw, bh) * 0.18));
+        const ligneH = (y, x0, x1) => { let m = 0; for (let j = 0; j <= ep; j++) m = Math.max(m, sombreDans(x0, y(j), x1, y(j))); return m; };
+        const ligneV = (x, y0, y1) => { let m = 0; for (let j = 0; j <= ep; j++) m = Math.max(m, sombreDans(x(j), y0, x(j), y1)); return m; };
+        const cotes = [
+          ligneH(j => miny + j, minx + bw * 0.2, maxx - bw * 0.2), ligneH(j => maxy - j, minx + bw * 0.2, maxx - bw * 0.2),
+          ligneV(j => minx + j, miny + bh * 0.2, maxy - bh * 0.2), ligneV(j => maxx - j, miny + bh * 0.2, maxy - bh * 0.2)
+        ];
+        if (Math.min.apply(null, cotes) < 0.6) continue;
+      }
+      cands.push({ cx: (minx + maxx) / 2, cy: (miny + maxy) / 2, d: (bw + bh) / 2 });
+    }
+    if (cands.length < nbCols * 2) return { erreur: "Aucune case reconnue sur la photo." };
+
+    // inclinaison de la feuille : direction médiane entre voisins horizontaux de même taille
+    const angles = [];
+    cands.forEach(c => {
+      let best = null, bd = Infinity;
+      cands.forEach(o => {
+        if (o === c) return;
+        const dx = o.cx - c.cx, dy = o.cy - c.cy;
+        if (dx <= c.d * 2.5 || Math.abs(dy) > dx * 0.21 || o.d < c.d * 0.85 || o.d > c.d * 1.18) return;
+        if (dx < bd) { bd = dx; best = o; }
+      });
+      if (best) angles.push(Math.atan2(best.cy - c.cy, best.cx - c.cx));
+    });
+    angles.sort((a, b) => a - b);
+    const ang = (sansRedresser || angles.length < 8) ? 0 : angles[Math.floor(angles.length / 2)];
+    const cosA = Math.cos(ang), sinA = Math.sin(ang), mx = w / 2, my = h / 2;
+    // positions redressées pour le regroupement ; positions d'origine pour la mesure
+    cands.forEach(c => {
+      c.ox = c.cx; c.oy = c.cy;
+      const X = c.cx - mx, Y = c.cy - my;
+      c.cx = mx + X * cosA + Y * sinA; c.cy = my - X * sinA + Y * cosA;
+    });
+    const versImage = (x, y) => { const X = x - mx, Y = y - my; return { x: mx + X * cosA - Y * sinA, y: my + X * sinA + Y * cosA }; };
+
+    // taille des cases : celle qui forme le plus de lignes complètes de nbCols cases
+    const grouperLignes = (liste, dRef) => {
+      const L = [];
+      liste.slice().sort((a, b) => a.cy - b.cy).forEach(b => {
+        const l = L.find(x => Math.abs(x.y - b.cy) < dRef * 0.7);
+        if (l) { l.b.push(b); l.y = l.b.reduce((s, x) => s + x.cy, 0) / l.b.length; }
+        else L.push({ y: b.cy, b: [b] });
+      });
+      return L;
+    };
+    const tailles = cands.map(c => c.d).sort((a, b) => a - b);
+    let dTyp = tailles[Math.floor(tailles.length / 2)], meilleurScore = -1;
+    tailles.forEach(t => {
+      const sel = cands.filter(c => c.d >= t * 0.8 && c.d <= t * 1.25);
+      if (sel.length < nbCols * 2) return;
+      const score = grouperLignes(sel, t).filter(l => l.b.length === nbCols).length;
+      if (score > meilleurScore || (score === meilleurScore && t > dTyp)) { meilleurScore = score; dTyp = t; }
+    });
+    // cases de la bonne taille ; deux morceaux au même endroit (anneau + point) = une seule case
+    const cases = [];
+    cands.filter(c => c.d >= dTyp * 0.75 && c.d <= dTyp * 1.33).sort((a, b) => b.d - a.d).forEach(c => {
+      if (!cases.some(o => Math.abs(o.cx - c.cx) < dTyp * 0.45 && Math.abs(o.cy - c.cy) < dTyp * 0.45)) cases.push(c);
+    });
+    const lignes = grouperLignes(cases, dTyp);
+
+    // colonnes : positions médianes dans les lignes complètes
+    const completes = lignes.filter(l => l.b.length === nbCols).map(l => l.b.slice().sort((a, b) => a.cx - b.cx));
+    if (completes.length < 3) return { erreur: "La grille de la fiche n'a pas été reconnue (lignes de " + nbCols + " cases introuvables)." };
+    const col = Array.from({ length: nbCols }, (_, k) => { const v = completes.map(t => t[k].cx).sort((a, b) => a - b); return v[Math.floor(v.length / 2)]; });
+    let pas = Infinity;
+    for (let k = 1; k < nbCols; k++) pas = Math.min(pas, col[k] - col[k - 1]);
+    const candidates = lignes.map(l => {
+      const pos = new Array(nbCols).fill(null);
+      l.b.forEach(b => {
+        let k = 0;
+        for (let kk = 1; kk < nbCols; kk++) if (Math.abs(b.cx - col[kk]) < Math.abs(b.cx - col[k])) k = kk;
+        if (Math.abs(b.cx - col[k]) < pas * 0.3 && !pos[k]) pos[k] = b;
+      });
+      return { y: l.y, pos, n: pos.filter(Boolean).length };
+    });
+    const pleines = candidates.filter(l => l.n === nbCols).sort((a, b) => a.y - b.y);
+    const ecarts = [];
+    for (let i = 1; i < pleines.length; i++) ecarts.push(pleines[i].y - pleines[i - 1].y);
+    ecarts.sort((a, b) => a - b);
+    const pasY = ecarts.length ? ecarts[Math.floor(ecarts.length / 2)] : dTyp * 3;
+    const surLaGrille = (y) => pleines.some(p => { const k = Math.round(Math.abs(y - p.y) / pasY); return k >= 1 && k <= 3 && Math.abs(Math.abs(y - p.y) - k * pasY) < pasY * 0.25; });
+    const haut = pleines.length ? pleines[0].y - pasY * 1.3 : -Infinity, bas = pleines.length ? pleines[pleines.length - 1].y + pasY * 1.3 : Infinity;
+    const minPartiel = nbCols >= 6 ? Math.ceil(nbCols * 0.6) : Math.max(2, nbCols - 1);
+    // grille large (8 cases) : 4 cases alignées suffisent ; grille de 3 : ligne partielle seulement sur le pas du tableau
+    const retenues = candidates.filter(l => l.n === nbCols ||
+      (nbCols >= 6 ? l.n >= minPartiel : (l.n >= minPartiel && l.y > haut && l.y < bas && surLaGrille(l.y)))).sort((a, b) => a.y - b.y);
+
+    // noircissement de l'intérieur de chaque case
+    const pixels = (x, y, r0, r1) => {
+      const out = [];
+      for (let dy = -r1; dy <= r1; dy++) for (let dx = -r1; dx <= r1; dx++) {
+        const q = dx * dx + dy * dy;
+        if (q > r1 * r1 || q < r0 * r0) continue;
+        const X = Math.round(x + dx), Y = Math.round(y + dy);
+        if (X >= 0 && Y >= 0 && X < w && Y < h) out.push(g[Y * w + X]);
+      }
+      return out.sort((a, b) => a - b);
+    };
+    const interieur = (x, y) => {
+      const rc = Math.max(1.5, dTyp * 0.22);
+      const centre = pixels(x, y, 0, rc);
+      const tout = pixels(x, y, 0, dTyp * 0.6);
+      const papier = pixels(x, y, dTyp * 0.75, dTyp * 1.1);
+      if (!centre.length || !papier.length || !tout.length) return 0;
+      const moyC = centre.reduce((s, v) => s + v, 0) / centre.length;
+      const bg = papier[Math.floor(papier.length * 0.85)];
+      const encre = Math.min(tout[Math.floor(tout.length * 0.05)], bg - 40);
+      const relatif = Math.max(0, Math.min(1, (bg - moyC) / Math.max(30, bg - encre)));
+      // croix / coche : part de pixels sombres à l'intérieur (bord de la case exclu)
+      const a = dTyp * 0.3;
+      const trace = sombreDans(x - a, y - a, x + a, y + a);
+      return forme === "carre" ? Math.max(relatif, Math.min(1, trace * 2.2)) : relatif;
+    };
+    const resultat = retenues.map(l => {
+      const taux = col.map((cx, k) => {
+        if (l.pos[k]) return interieur(l.pos[k].ox, l.pos[k].oy);
+        const q = versImage(cx, l.y); return interieur(q.x, q.y);
+      });
+      return { taux };
+    });
+    const completude = retenues.length ? retenues.reduce((a, l) => a + l.n, 0) / (retenues.length * nbCols) : 0;
+    return { lignes: resultat, trouvees: resultat.length, completude };
+  }
+
+  /* essaie plusieurs résolutions de travail et garde la lecture la plus cohérente */
+  function lireGrilleCases(img, nbCols, forme, attendues) {
+    let meilleur = null, meilleurScore = -Infinity;
+    [1600, 1300, 2000, 1100].forEach(cible => [false, true].forEach(sansRedresser => {
+      const r = lireGrilleCasesA(img, nbCols, forme, cible, sansRedresser);
+      if (r.erreur) { if (!meilleur) meilleur = r; return; }
+      const nets = r.lignes.reduce((s, l) => { const t = l.taux.slice().sort((a, b) => b - a); return s + (t[0] - (t[1] || 0)); }, 0);
+      const q = r.completude || 0;
+      const score = (attendues ? -Math.abs(r.trouvees - attendues) * 10 : r.trouvees * 2 * q * q) + nets / Math.max(1, r.trouvees) + q;
+      if (score > meilleurScore) { meilleurScore = score; meilleur = r; }
+    }));
+    return meilleur;
+  }
+
+  /* fiche individuelle : lignes de 3 bulles, une seule cochée par ligne */
+  function lireFicheBulles(img, nbLignes) {
+    const r = lireGrilleCases(img, 3, null, nbLignes);
+    if (r.erreur) return r;
+    const lignes = r.lignes.map(l => {
+      const taux = l.taux;
+      const max = Math.max.apply(null, taux), idx = taux.indexOf(max);
+      const second = taux.slice().sort((a, b) => b - a)[1];
+      const choix = max >= 0.45 ? idx : null;
+      const doute = choix === null ? max >= 0.3 : (second >= 0.4 || max - second < 0.25);
+      return { taux, choix, doute };
+    });
+    return { lignes: nbLignes ? lignes.slice(0, nbLignes) : lignes, trouvees: lignes.length, attendues: nbLignes || lignes.length };
+  }
+
+  /* fiche collective : lignes de 8 cases (équipe 1 puis équipe 2), plusieurs cases possibles */
+  function lireFicheCollectiveCases(img) {
+    const r = lireGrilleCases(img, 8, "carre");
+    if (r.erreur) return r;
+    const lignes = r.lignes.map(l => ({
+      taux: l.taux,
+      coche: l.taux.map(t => t >= 0.4),
+      doute: l.taux.map(t => t >= 0.25 && t < 0.55)
+    }));
+    return { lignes, trouvees: lignes.length };
+  }
+
   function analyserImage(img) {
     const gr = toGray(img, 1400);
+    // seuillage adaptatif (moyenne locale) : une ombre ou un éclairage inégal
+    // ne noircit plus toute une moitié de la photo
     const seuil = otsu(gr.g);
     gr.bin = new Uint8Array(gr.w * gr.h);
-    for (let i = 0; i < gr.g.length; i++) gr.bin[i] = gr.g[i] < seuil ? 1 : 0;
+    {
+      const w = gr.w, h = gr.h, g = gr.g, I = new Float64Array((w + 1) * (h + 1));
+      for (let y = 0; y < h; y++) {
+        let s = 0;
+        for (let x = 0; x < w; x++) { s += g[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + s; }
+      }
+      const R = Math.max(20, Math.round(w / 22));
+      for (let y = 0; y < h; y++) {
+        const y0 = Math.max(0, y - R), y1 = Math.min(h, y + R + 1);
+        for (let x = 0; x < w; x++) {
+          const x0 = Math.max(0, x - R), x1 = Math.min(w, x + R + 1);
+          const m = (I[y1 * (w + 1) + x1] - I[y0 * (w + 1) + x1] - I[y1 * (w + 1) + x0] + I[y0 * (w + 1) + x0]) / ((x1 - x0) * (y1 - y0));
+          const v = g[y * w + x];
+          gr.bin[y * w + x] = (v < m * 0.78 && v < m - 25) || v < Math.min(seuil, 60) ? 1 : 0;
+        }
+      }
+    }
 
     const W = gr.w, H2 = gr.h, qx = Math.round(W * 0.42), qy = Math.round(H2 * 0.42);
     const coins = [
@@ -13847,6 +14131,18 @@ body.printing-sheets #sheet-zone{display:block;}
     const hauteur = Math.hypot(coins[3].cx - coins[0].cx, coins[3].cy - coins[0].cy);
     const type = largeur >= hauteur ? "ind" : "col";
     const G = type === "ind" ? G_IND : G_COL;
+    {
+      const tl = coins.map(c => c.taille), tmin = Math.min.apply(null, tl), tmax = Math.max.apply(null, tl);
+      const mc = mkCenters(G), attendu = (mc[1].x - mc[0].x) / (mc[3].y - mc[0].y);
+      const largeur2 = Math.hypot(coins[2].cx - coins[3].cx, coins[2].cy - coins[3].cy);
+      const hauteur2 = Math.hypot(coins[2].cx - coins[1].cx, coins[2].cy - coins[1].cy);
+      const mesure = (largeur + largeur2) / (hauteur + hauteur2);
+      const aireRep = tmax * tmax, aireFeuille = largeur * hauteur;
+      if (tmax > tmin * 2 || mesure < attendu * 0.75 || mesure > attendu * 1.33 ||
+          Math.min(largeur, largeur2) < Math.max(largeur, largeur2) * 0.7 ||
+          Math.min(hauteur, hauteur2) < Math.max(hauteur, hauteur2) * 0.7 || aireRep > aireFeuille * 0.02)
+        return { erreur: "Les 4 repères noirs de la grille terrain ne sont pas cohérents." };
+    }
     const Hm = homographie(mkCenters(G), coins.map(c => ({ x: c.cx, y: c.cy })));
     if (!Hm) return { erreur: "Impossible de redresser l'image." };
     return { type, gr, H: Hm, G };
@@ -13871,8 +14167,11 @@ body.printing-sheets #sheet-zone{display:block;}
         const max = Math.max.apply(null, taux);
         const idx = taux.indexOf(max);
         const second = taux.slice().sort((a, b2) => b2 - a)[1];
-        if (max >= 0.35 && max - second >= 0.12) { scores[cp.id] = idx; vide = false; }
-        else if (max >= 0.35) { scores[cp.id] = idx; doutes.push(cp.id); vide = false; }
+        if (max >= 0.15 && max - second >= 0.1) {
+          scores[cp.id] = idx; vide = false;
+          if (max < 0.22 || second >= 0.15) doutes.push(cp.id);
+        }
+        else if (max >= 0.15) { scores[cp.id] = idx; doutes.push(cp.id); vide = false; }
       });
       lignes.push({ index: i, scores, doutes, vide });
     }
@@ -13886,7 +14185,7 @@ body.printing-sheets #sheet-zone{display:block;}
       [0, 1].forEach(e => {
         COL_KEYS.forEach((k, ki) => {
           const b = colBubble(i, e, ki);
-          row[e ? "e2" : "e1"][k] = tauxBulle(r.gr, r.H, b.x, b.y, G_COL.r) >= 0.4;
+          row[e ? "e2" : "e1"][k] = tauxBulle(r.gr, r.H, b.x, b.y, G_COL.r) >= 0.2;
         });
       });
       rows.push(row);
@@ -13896,6 +14195,14 @@ body.printing-sheets #sheet-zone{display:block;}
 
   /* ---------- page « Grilles terrain » ---------- */
   let scanResultat = null;   // résultat en attente de validation
+  let dernierImport = null;  // état avant le dernier import appliqué (↩ annuler)
+  function memoImport(cl) {
+    dernierImport = {
+      cl, clId: cl.id,
+      scores: cl.eleves.map(e => ({ e, id: e.id, s: JSON.parse(JSON.stringify(e.scores || {})) })),
+      collectif: JSON.parse(JSON.stringify(cl.collectif || null))
+    };
+  }
   let scanOutId = "scan-out";     // conteneur de vérification
   let scanEtatId = "scan-etat";   // ligne d'état
 
@@ -13913,7 +14220,11 @@ body.printing-sheets #sheet-zone{display:block;}
           <button class="btn btn-primary" id="${hostId}-print">🖨 Imprimer la grille</button>
           <input type="file" id="${hostId}-file" accept="image/*" hidden>
           <button class="btn btn-amber" id="${hostId}-scan">📷 Importer la photo remplie</button>
+          <button class="btn" id="${hostId}-undo" ${dernierImport && dernierImport.clId === cl.id ? "" : "hidden"}>↩ Annuler le dernier import</button>
+          ${type === "ind" ? `<button class="btn" id="${hostId}-raz" title="Remet à vide le diagnostic individuel de tous les élèves de la classe">🧹 Effacer tous les diagnostics</button>` : ""}
         </div>
+        <p class="hint" style="margin:8px 0 0;">📷 Accepte la <b>grille terrain</b> (4 carrés noirs) <b>ou</b> la photo de la ${type === "ind"
+          ? "<b>fiche de diagnostic individuel</b> imprimée d'un élève" : "<b>fiche collective</b> imprimée (tableau des échanges, cases cochées ou croix)"}.</p>
         <div class="hint" id="${hostId}-etat"></div>
       </div>
       <div id="${hostId}-out"></div>`;
@@ -13921,6 +14232,24 @@ body.printing-sheets #sheet-zone{display:block;}
     $(hostId + "-print").onclick = () => {
       if (type === "ind" && !cl.eleves.length) { toast("Ajoutez d'abord des élèves"); return; }
       imprimerFeuilles(type, cl);
+    };
+    $(hostId + "-undo").onclick = () => {
+      if (!dernierImport || dernierImport.clId !== cl.id) return;
+      confirmModal("Annuler le dernier import", "Les notes et la grille collective reviennent à leur état d'avant le dernier import de photo. Continuer ?", "Annuler l'import", () => {
+        dernierImport.scores.forEach(x => { const e = cl.eleves.find(y => y.id === x.id); if (e) e.scores = x.s; });
+        if (dernierImport.collectif) cl.collectif = dernierImport.collectif;
+        dernierImport = null; scanResultat = null;
+        save(); toast("Dernier import annulé"); render();
+      });
+    };
+    if ($(hostId + "-raz")) $(hostId + "-raz").onclick = () => {
+      const n = cl.eleves.filter(eleveEvalue).length;
+      if (!n) { toast("Aucun élève n'a de diagnostic individuel"); return; }
+      confirmModal("Effacer tous les diagnostics", "Le diagnostic individuel de " + n + " élève(s) de la classe « " + cl.nom + " » sera remis à vide. Continuer ?", "Effacer", () => {
+        memoImport(cl);
+        cl.eleves.forEach(e => { e.scores = {}; });
+        save(); toast(n + " diagnostic(s) effacé(s) — « ↩ Annuler le dernier import » permet de revenir en arrière"); render();
+      });
     };
     $(hostId + "-scan").onclick = () => {
       scanOutId = hostId + "-out";
@@ -13942,8 +14271,32 @@ body.printing-sheets #sheet-zone{display:block;}
     lecteur.onload = () => {
       const img = new Image();
       img.onload = () => {
+        // 1) fiche de diagnostic individuel imprimée (bulles en lignes de 3, sans carrés noirs)
+        const fb = lireFicheBulles(img, COMPETENCES.length);
+        if (!fb.erreur && fb.trouvees >= Math.max(3, COMPETENCES.length - 2)) {
+          scanResultat = { type: "fiche", data: fb };
+          $(scanEtatId).textContent = "Fiche individuelle détectée — " + Math.min(fb.trouvees, COMPETENCES.length) + " / " +
+            COMPETENCES.length + " compétence(s) lue(s). Vérifiez ci-dessous avant d'appliquer.";
+          afficherVerification(cl);
+          if (input) input.value = "";
+          return;
+        }
+        // 2) fiche collective imprimée (lignes de 8 cases : équipe 1 puis équipe 2)
+        const fc = lireFicheCollectiveCases(img);
+        if (!fc.erreur && fc.trouvees >= 4) {
+          scanResultat = { type: "fichecol", data: fc };
+          $(scanEtatId).textContent = "Fiche collective détectée — " + fc.trouvees + " échange(s) lu(s). Vérifiez ci-dessous avant d'appliquer.";
+          afficherVerification(cl);
+          if (input) input.value = "";
+          return;
+        }
+        // 3) grille terrain à 4 repères noirs
         const r = analyserImage(img);
-        if (r.erreur) { $(scanEtatId).textContent = "⚠ " + r.erreur; if (input) input.value = ""; return; }
+        if (r.erreur) {
+          $(scanEtatId).textContent = "⚠ Photo non reconnue : ni fiche individuelle, ni fiche collective, ni grille terrain. " +
+            "Photographiez le tableau entier, à plat, bien éclairé et d'assez près (les cases doivent être nettes).";
+          if (input) input.value = ""; return;
+        }
         scanResultat = r.type === "ind"
           ? { type: "ind", data: lireFeuilleIndividuelle(r) }
           : { type: "col", data: lireFeuilleCollective(r) };
@@ -13985,6 +14338,154 @@ body.printing-sheets #sheet-zone{display:block;}
   function afficherVerification(cl) {
     const out = $(scanOutId);
     if (!scanResultat) { out.innerHTML = ""; return; }
+
+    if (scanResultat.type === "fichecol") {
+      const d = scanResultat.data;
+      const co = cl.collectif;
+      const titres = (() => {
+        const th = [...document.querySelectorAll(".rally-table thead tr:nth-child(2) th")].map(x => x.textContent.trim());
+        return th.length >= 8 ? th.slice(0, 4) : ["Faute", "Niveau 1", "Niveau 2", "Niveau 3"];
+      })();
+      const lignes = d.lignes.map(l => ({ coche: l.coche.slice(), doute: l.doute.slice(), taux: l.taux }));
+      let dernier = -1;
+      lignes.forEach((l, i) => { if (l.coche.some(Boolean)) dernier = i; });
+      const derniereSaisie = (() => { let k = 0; co.rows.forEach((r, i) => { if (COL_KEYS.some(x => r.e1[x] || r.e2[x])) k = i + 1; }); return k; })();
+      out.innerHTML = `
+        <div class="card">
+          <div class="card-title">Vérification — fiche collective
+            <span class="sub">${d.trouvees} ligne(s) lue(s) · ${dernier + 1} échange(s) renseigné(s)</span></div>
+          <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px;">
+            <div class="field"><label for="scan-debut">1re ligne de la photo = échange n°</label>
+              <input class="input" id="scan-debut" type="number" min="1" value="1" style="width:110px;"></div>
+            <button class="btn btn-sm" id="scan-suite" type="button" title="Pour une 2e page de fiche">À la suite des ${derniereSaisie} échange(s) déjà saisis</button>
+            <span style="flex:1"></span>
+            <button class="btn btn-primary" id="scan-apply">✔ Appliquer à la grille collective</button>
+            <button class="btn" id="scan-cancel">Annuler</button>
+          </div>
+          <div class="table-wrap"><table>
+            <thead>
+              <tr><th rowspan="2">Échange</th><th colspan="4" class="eq1" style="text-align:center;">Équipe 1</th><th colspan="4" class="eq2" style="text-align:center;">Équipe 2</th></tr>
+              <tr>${titres.map(t => `<th style="text-align:center;">${esc(t)}</th>`).join("")}${titres.map(t => `<th style="text-align:center;">${esc(t)}</th>`).join("")}</tr>
+            </thead>
+            <tbody id="scan-col-body">${lignes.map((l, i) => i > dernier ? "" : `<tr>
+              <td class="scan-num"><b>${i + 1}</b></td>
+              ${l.coche.map((c, k) => `<td style="text-align:center;${l.doute[k] ? "background:var(--inter-soft);" : ""}">
+                <input type="checkbox" data-l="${i}" data-k="${k}" ${c ? "checked" : ""} aria-label="Échange ${i + 1}, case ${k + 1}"></td>`).join("")}
+            </tr>`).join("") || `<tr><td colspan="9" class="empty">Aucune case cochée n'a été lue.</td></tr>`}</tbody>
+          </table></div>
+          <p class="hint">Les cases sur fond orange sont incertaines (trait léger, croix débordante…) : cochez ou décochez-les avant d'appliquer.
+            Les lignes vides en fin de fiche sont ignorées. Pour une fiche de plusieurs pages, importez chaque page et indiquez le numéro de son premier échange.</p>
+        </div>`;
+      const renum = () => {
+        const deb = Math.max(1, Number($("scan-debut").value) || 1);
+        out.querySelectorAll(".scan-num").forEach((td, i) => { td.innerHTML = "<b>" + (deb + i) + "</b>"; });
+      };
+      $("scan-debut").oninput = renum;
+      $("scan-suite").onclick = () => { $("scan-debut").value = derniereSaisie + 1; renum(); };
+      out.querySelectorAll('#scan-col-body input[type="checkbox"]').forEach(cb => cb.onchange = () => {
+        lignes[Number(cb.dataset.l)].coche[Number(cb.dataset.k)] = cb.checked;
+        cb.closest("td").style.background = "";
+      });
+      $("scan-cancel").onclick = () => { scanResultat = null; afficherVerification(cl); $(scanEtatId).textContent = ""; };
+      $("scan-apply").onclick = () => {
+        memoImport(cl);
+        const deb = Math.max(1, Number($("scan-debut").value) || 1) - 1;
+        let n = 0;
+        for (let i = 0; i <= dernier; i++) {
+          while (co.rows.length <= deb + i) co.rows.push(emptyCollectif().rows[0]);
+          const row = co.rows[deb + i];
+          COL_KEYS.forEach((key, k) => { row.e1[key] = !!lignes[i].coche[k]; row.e2[key] = !!lignes[i].coche[k + 4]; });
+          n++;
+        }
+        save(); scanResultat = null; $(scanEtatId).textContent = "";
+        toast(n + " échange(s) appliqué(s) à la grille collective (n° " + (deb + 1) + " à " + (deb + n) + ")");
+        render();
+      };
+      return;
+    }
+
+    if (scanResultat.type === "fiche") {
+      const d = scanResultat.data;
+      const vals = COMPETENCES.map((cp, i) => d.lignes[i] ? d.lignes[i].choix : null);
+      const doutes = COMPETENCES.map((cp, i) => !d.lignes[i] || d.lignes[i].doute || d.lignes[i].choix === null);
+      // élève proposé : jamais un élève déjà évalué (on n'écrase pas une fiche précédente) ;
+      // la fiche affichée à l'écran si elle est vierge, sinon le premier élève non évalué
+      const ficheVue = ficheEleveId && cl.eleves.find(e => e.id === ficheEleveId && !eleveEvalue(e));
+      // par défaut, la fiche est le diagnostic de TOUTE la classe
+      const defaut = d.appliqueA || (cl.eleves.length ? "__classe__" : "");
+      const totalF = () => vals.reduce((s, v) => s + (Number(v) || 0), 0);
+      const copie = (o) => JSON.parse(JSON.stringify(o || {}));
+      const cibles = () => d.appliqueA === "__classe__" ? cl.eleves : cl.eleves.filter(e => e.id === d.appliqueA);
+      const ecrire = () => {
+        cibles().forEach(el => {
+          el.scores = copie(d.avant && d.avant[el.id]);
+          COMPETENCES.forEach((cp, i) => { if (vals[i] !== null && vals[i] !== undefined) el.scores[cp.id] = vals[i]; });
+        });
+        if (d.appliqueA && d.appliqueA !== "__classe__") ficheEleveId = d.appliqueA;
+        save();
+      };
+      const restaurer = () => {
+        Object.keys(d.avant || {}).forEach(id => { const el = cl.eleves.find(e => e.id === id); if (el) el.scores = copie(d.avant[id]); });
+      };
+      const viser = (id) => {
+        restaurer();
+        d.appliqueA = id || null;
+        d.avant = {};
+        cibles().forEach(el => { d.avant[el.id] = copie(el.scores); });
+        ecrire();
+      };
+      if (!d.appliqueA && defaut) { memoImport(cl); viser(defaut); }
+      const nomVise = () => {
+        if (d.appliqueA === "__classe__") return "toute la classe (" + cl.eleves.length + " élèves)";
+        const e = cl.eleves.find(x => x.id === d.appliqueA); return e ? e.nom : "—";
+      };
+      out.innerHTML = `
+        <div class="card">
+          <div class="card-title">Vérification — fiche individuelle
+            <span class="sub">${Math.min(d.trouvees, COMPETENCES.length)} / ${COMPETENCES.length} compétence(s) lue(s)</span></div>
+          ${d.trouvees < COMPETENCES.length ? `<p class="hint" style="color:var(--lacune);">Certaines lignes n'ont pas été lues : complétez-les dans le tableau.</p>` : ""}
+          <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px;">
+            <div class="field" style="min-width:230px;"><label for="scan-eleve">Cette fiche concerne</label>
+              <select class="input" id="scan-eleve"><option value="__classe__" ${d.appliqueA === "__classe__" ? "selected" : ""}>👥 Toute la classe (${cl.eleves.length} élèves)</option>${cl.eleves.map(e => `<option value="${e.id}" ${e.id === d.appliqueA ? "selected" : ""}>${esc(e.nom)}</option>`).join("")}</select></div>
+            <button class="btn btn-primary" id="scan-apply">✔ Terminé — voir l'analyse</button>
+            <button class="btn" id="scan-cancel">Annuler l'import</button>
+          </div>
+          <p class="hint" id="scan-f-ok" style="margin:0 0 10px;color:var(--maitrise);font-weight:600;">✔ Notes enregistrées pour « ${esc(nomVise())} » — le diagnostic et l'analyse didactique sont déjà mis à jour. Changez d'élève ou corrigez une case : c'est enregistré aussitôt.</p>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Compétence observée</th><th style="text-align:center;">Niveau 1 · 0</th><th style="text-align:center;">Niveau 2 · 1</th><th style="text-align:center;">Niveau 3 · 2</th><th>Lu</th></tr></thead>
+            <tbody>${COMPETENCES.map((cp, i) => `<tr${doutes[i] ? ' style="background:var(--inter-soft);"' : ""}>
+              <td><b>${esc(cp.nom)}</b>${doutes[i] ? ' <span class="tag t-inter">à vérifier</span>' : ""}</td>
+              ${[0, 1, 2].map(v => `<td style="text-align:center;"><input type="radio" name="scan-f-${i}" value="${v}" data-i="${i}" ${vals[i] === v ? "checked" : ""} aria-label="${esc(cp.nom)} : ${v}"></td>`).join("")}
+              <td class="muted" style="font-size:.78rem;">${d.lignes[i] ? d.lignes[i].taux.map(t => Math.round(t * 100) + "%").join(" · ") : "non lue"}</td>
+            </tr>`).join("")}</tbody>
+          </table></div>
+          <p style="margin:10px 0 0;">Total lu : <b id="scan-f-total">${totalF()}</b> / 20</p>
+          <p class="hint">Les lignes surlignées sont incertaines (bulle peu remplie, deux bulles ou ligne non lue) : cochez la bonne valeur (c'est enregistré aussitôt).
+            Les pourcentages indiquent le noircissement mesuré de chaque bulle (niveau 1 · 2 · 3).</p>
+        </div>`;
+      out.querySelectorAll('input[type="radio"][name^="scan-f-"]').forEach(r => r.onchange = () => {
+        vals[Number(r.dataset.i)] = Number(r.value);
+        r.closest("tr").style.background = "";
+        $("scan-f-total").textContent = totalF();
+        ecrire();
+      });
+      $("scan-eleve").onchange = () => {
+        viser($("scan-eleve").value);
+        $("scan-f-ok").textContent = "✔ Notes enregistrées pour « " + nomVise() + " » — le diagnostic et l'analyse didactique sont déjà mis à jour.";
+      };
+      $("scan-cancel").onclick = () => {
+        restaurer(); save(); scanResultat = null; afficherVerification(cl); $(scanEtatId).textContent = "";
+        toast("Import annulé : les notes de l'élève sont revenues à leur état précédent"); render();
+      };
+      $("scan-apply").onclick = () => {
+        ecrire();
+        const nom = nomVise();
+        scanResultat = null; $(scanEtatId).textContent = "";
+        toast("Fiche enregistrée pour " + nom + " : " + totalF() + "/20");
+        page = "analyse"; render();
+      };
+      return;
+    }
 
     if (scanResultat.type === "ind") {
       const d = scanResultat.data;
@@ -14045,21 +14546,22 @@ body.printing-sheets #sheet-zone{display:block;}
       $("scan-page").onchange = dessine;
       $("scan-cancel").onclick = () => { scanResultat = null; afficherVerification(cl); $(scanEtatId).textContent = ""; };
       $("scan-apply").onclick = () => {
+        memoImport(cl);
         const numPage = Number($("scan-page").value);   // ne pas masquer la variable « page » de navigation
         const deb = (numPage - 1) * G_IND.rowsPerPage;
-        let n = 0;
-        d.lignes.forEach((ln, i) => {
-          const el = cl.eleves[deb + i];
-          if (!el || ln.vide) return;
-          COMPETENCES.forEach(cp => {
-            if (ln.scores[cp.id] === undefined) return;
-            el.scores[cp.id] = ln.scores[cp.id];
+        const cibles = d.lignes.map((ln, i) => ({ ln, el: cl.eleves[deb + i] }))
+          .filter(x => x.el && COMPETENCES.some(cp => x.ln.scores[cp.id] !== undefined));
+        if (!cibles.length) { toast("Aucune ligne remplie sur cette grille"); return; }
+        const faire = () => {
+          cibles.forEach(({ ln, el }) => {
+            COMPETENCES.forEach(cp => { if (ln.scores[cp.id] !== undefined) el.scores[cp.id] = ln.scores[cp.id]; });
           });
-          n++;
-        });
-        save(); scanResultat = null;
-        toast(n + " élève(s) importé(s) — analyse mise à jour");
-        page = "analyse"; render();
+          save(); scanResultat = null;
+          toast(cibles.length + " élève(s) importé(s) — analyse mise à jour");
+          page = "analyse"; render();
+        };
+        confirmModal("Appliquer la grille terrain", "Cette grille va modifier le diagnostic de " + cibles.length + " élève(s) : " +
+          cibles.map(x => x.el.nom).join(", ") + ". Continuer ?", "Appliquer", faire);
       };
       return;
     }
@@ -14089,6 +14591,7 @@ body.printing-sheets #sheet-zone{display:block;}
     });
     $("scan-cancel").onclick = () => { scanResultat = null; afficherVerification(cl); $(scanEtatId).textContent = ""; };
     $("scan-apply").onclick = () => {
+      memoImport(cl);
       cl.collectif.rows = d.rows.map(r => ({
         e1: Object.assign({}, r.e1), e2: Object.assign({}, r.e2)
       }));
@@ -17310,6 +17813,7 @@ body.printing-sheets #sheet-zone{display:block;}
   function load() {
     try {
       const raw = localStorage.getItem(STORE_KEY);
+      brutConnu = raw;
       if (raw) data = JSON.parse(raw);
     } catch (e) { /* stockage indisponible */ }
     if (!data || !Array.isArray(data.classes)) data = { classes: [], activeId: null };
@@ -17320,11 +17824,12 @@ body.printing-sheets #sheet-zone{display:block;}
     });
   }
 
-  let saveTimer = null;
+  let saveTimer = null, brutConnu = null;
   function save() {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
-      try { localStorage.setItem(STORE_KEY, JSON.stringify(data)); }
+      saveTimer = null;
+      try { const brut = JSON.stringify(data); localStorage.setItem(STORE_KEY, brut); brutConnu = brut; }
       catch (e) { toast("Sauvegarde impossible (stockage plein ou bloqué)"); }
     }, 180);
   }
@@ -17667,7 +18172,22 @@ body.printing-sheets #sheet-zone{display:block;}
     sel.onchange = () => { data.activeId = sel.value; save(); render(); };
   }
 
+  function resynchroniser() {
+    if (saveTimer) return false;          // une sauvegarde locale est en attente : elle prime
+    let brut = null;
+    try { brut = localStorage.getItem(STORE_KEY); } catch (e) { return false; }
+    if (!brut || brut === brutConnu) return false;
+    const actif = data.activeId;
+    load();
+    if (actif && data.classes.some(c => c.id === actif)) data.activeId = actif;
+    return true;
+  }
+  window.addEventListener("storage", (e) => { if (e.key === STORE_KEY && resynchroniser()) render(); });
+  window.addEventListener("focus", () => { if (resynchroniser()) render(); });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && resynchroniser()) render(); });
+
   function render() {
+    resynchroniser();
     renderNav();
     renderClasseSelect();
     const cl = classe();
@@ -18023,6 +18543,7 @@ body.printing-sheets #sheet-zone{display:block;}
         <button class="btn" id="fiche-prev" ${idx === 0 ? "disabled" : ""}>← Précédent</button>
         <button class="btn" id="fiche-next" ${idx === cl.eleves.length - 1 ? "disabled" : ""}>Suivant →</button>
         <span style="flex:1"></span>
+        <button class="btn" id="fiche-raz" ${eleveEvalue(el) ? "" : "disabled"}>🧹 Effacer le diagnostic de cet élève</button>
         <button class="btn btn-primary" id="fiche-print">🖨 Imprimer la fiche</button>
       </div>
 
@@ -18033,6 +18554,9 @@ body.printing-sheets #sheet-zone{display:block;}
         </div>
 
         <table class="fiche-id">
+          <tr>
+            <th>Élève :</th><td colspan="3"><b>${esc(el.nom)}</b></td>
+          </tr>
           <tr>
             <th>Classe :</th><td>${esc(cl.nom)}</td>
             <th>Date :</th><td><input class="fi" id="fi-date" type="date" value="${esc(en.date)}"></td>
@@ -18121,6 +18645,9 @@ body.printing-sheets #sheet-zone{display:block;}
     $("fiche-prev").onclick = () => { ficheEleveId = cl.eleves[idx - 1].id; render(); };
     $("fiche-next").onclick = () => { ficheEleveId = cl.eleves[idx + 1].id; render(); };
     $("fiche-print").onclick = () => { finPrintFeuilles(); window.print(); };
+    $("fiche-raz").onclick = () => confirmModal("Effacer le diagnostic", "Toutes les notes du diagnostic individuel de « " + el.nom + " » seront effacées. Continuer ?", "Effacer", () => {
+      el.scores = {}; save(); toast("Diagnostic de « " + el.nom + " » effacé"); render();
+    });
     $("fi-obs").oninput = () => { el.observations = $("fi-obs").value; save(); };
     $("fi-obj").oninput = () => { el.objectif = $("fi-obj").value; save(); };
     $("fi-date").onchange = () => { en.date = $("fi-date").value; save(); };
@@ -19238,11 +19765,271 @@ body.printing-sheets #sheet-zone{display:block;}
     return n ? sombre / n : 0;
   }
 
+
+  /* ---------- lecture d'une fiche imprimée SANS repères ----------
+     Repère les cases (bulles rondes ou cases carrées) d'un tableau, les range
+     en lignes de « nbCols » cases alignées, puis mesure le noircissement de
+     l'intérieur de chaque case (bulle remplie, croix, coche…).
+     forme : "rond" (fiche individuelle), "carre" (fiche collective) ou null. */
+  function lireGrilleCasesA(img, nbCols, forme, cible, sansRedresser) {
+    const sc = Math.max(0.2, Math.min(3, cible / img.width));
+    const w = Math.round(img.width * sc), h = Math.round(img.height * sc);
+    const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+    const cx0 = cv.getContext("2d"); cx0.imageSmoothingEnabled = true; cx0.imageSmoothingQuality = "high";
+    cx0.drawImage(img, 0, 0, w, h);
+    const d = cx0.getImageData(0, 0, w, h).data;
+    const g = new Float32Array(w * h);
+    for (let i = 0, j = 0; i < d.length; i += 4, j++) g[j] = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+
+    // seuillage adaptatif (moyenne locale) : résiste aux ombres et à l'éclairage inégal
+    const I = new Float64Array((w + 1) * (h + 1));
+    for (let y = 0; y < h; y++) {
+      let s = 0;
+      for (let x = 0; x < w; x++) { s += g[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + s; }
+    }
+    const R = Math.max(6, Math.round(w / 60));
+    const hist = new Array(256).fill(0);
+    for (let i = 0; i < g.length; i += 7) hist[Math.max(0, Math.min(255, g[i] | 0))]++;
+    let cum = 0, papier = 255; const tot = hist.reduce((a, b) => a + b, 0);
+    for (let v = 0; v < 256; v++) { cum += hist[v]; if (cum >= tot * 0.8) { papier = v; break; } }
+    const bin = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const y0 = Math.max(0, y - R), y1 = Math.min(h, y + R + 1);
+      for (let x = 0; x < w; x++) {
+        const x0 = Math.max(0, x - R), x1 = Math.min(w, x + R + 1);
+        const m = (I[y1 * (w + 1) + x1] - I[y0 * (w + 1) + x1] - I[y1 * (w + 1) + x0] + I[y0 * (w + 1) + x0]) / ((x1 - x0) * (y1 - y0));
+        const v = g[y * w + x];
+        bin[y * w + x] = ((v < m - 14 && v < 200) || v < papier * 0.62) ? 1 : 0;
+      }
+    }
+    const sombreDans = (x0, y0, x1, y1) => {
+      let n = 0, s = 0;
+      for (let y = Math.max(0, Math.round(y0)); y <= Math.min(h - 1, Math.round(y1)); y++)
+        for (let x = Math.max(0, Math.round(x0)); x <= Math.min(w - 1, Math.round(x1)); x++) { n++; s += bin[y * w + x]; }
+      return n ? s / n : 0;
+    };
+
+    // composantes connexes de taille et de forme compatibles avec une case
+    const vu = new Uint8Array(w * h);
+    const cands = [];
+    const dmin = w * 0.008, dmax = w * 0.06;
+    for (let yy = 0; yy < h; yy++) for (let xx = 0; xx < w; xx++) {
+      const i0 = yy * w + xx;
+      if (!bin[i0] || vu[i0]) continue;
+      let minx = xx, maxx = xx, miny = yy, maxy = yy, n = 0;
+      const pile = [i0]; vu[i0] = 1;
+      while (pile.length) {
+        const p = pile.pop(); n++;
+        const px = p % w, py = (p - px) / w;
+        if (px < minx) minx = px; if (px > maxx) maxx = px; if (py < miny) miny = py; if (py > maxy) maxy = py;
+        if (px + 1 < w && bin[p + 1] && !vu[p + 1]) { vu[p + 1] = 1; pile.push(p + 1); }
+        if (px > 0 && bin[p - 1] && !vu[p - 1]) { vu[p - 1] = 1; pile.push(p - 1); }
+        if (py + 1 < h && bin[p + w] && !vu[p + w]) { vu[p + w] = 1; pile.push(p + w); }
+        if (py > 0 && bin[p - w] && !vu[p - w]) { vu[p - w] = 1; pile.push(p - w); }
+      }
+      const bw = maxx - minx + 1, bh = maxy - miny + 1;
+      if (bw < dmin || bh < dmin || bw > dmax || bh > dmax) continue;
+      const ratio = bw / bh;
+      if (ratio < 0.72 || ratio > 1.38) continue;
+      if (n / (bw * bh) < 0.12) continue;
+      // forme : une case carrée a des coins occupés, une bulle ronde non
+      const cw = Math.max(1, bw * 0.15), ch = Math.max(1, bh * 0.15);
+      const coins = (sombreDans(minx, miny, minx + cw, miny + ch) + sombreDans(maxx - cw, miny, maxx, miny + ch) +
+                     sombreDans(minx, maxy - ch, minx + cw, maxy) + sombreDans(maxx - cw, maxy - ch, maxx, maxy)) / 4;
+      const rond = coins < 0.3;
+      if (forme === "rond" && !rond) continue;
+      if (forme === "carre") {
+        if (rond) continue;
+        // une case a 4 côtés : bord sombre sur la majeure partie de chaque côté (les chiffres non)
+        const ep = Math.max(1, Math.round(Math.min(bw, bh) * 0.18));
+        const ligneH = (y, x0, x1) => { let m = 0; for (let j = 0; j <= ep; j++) m = Math.max(m, sombreDans(x0, y(j), x1, y(j))); return m; };
+        const ligneV = (x, y0, y1) => { let m = 0; for (let j = 0; j <= ep; j++) m = Math.max(m, sombreDans(x(j), y0, x(j), y1)); return m; };
+        const cotes = [
+          ligneH(j => miny + j, minx + bw * 0.2, maxx - bw * 0.2), ligneH(j => maxy - j, minx + bw * 0.2, maxx - bw * 0.2),
+          ligneV(j => minx + j, miny + bh * 0.2, maxy - bh * 0.2), ligneV(j => maxx - j, miny + bh * 0.2, maxy - bh * 0.2)
+        ];
+        if (Math.min.apply(null, cotes) < 0.6) continue;
+      }
+      cands.push({ cx: (minx + maxx) / 2, cy: (miny + maxy) / 2, d: (bw + bh) / 2 });
+    }
+    if (cands.length < nbCols * 2) return { erreur: "Aucune case reconnue sur la photo." };
+
+    // inclinaison de la feuille : direction médiane entre voisins horizontaux de même taille
+    const angles = [];
+    cands.forEach(c => {
+      let best = null, bd = Infinity;
+      cands.forEach(o => {
+        if (o === c) return;
+        const dx = o.cx - c.cx, dy = o.cy - c.cy;
+        if (dx <= c.d * 2.5 || Math.abs(dy) > dx * 0.21 || o.d < c.d * 0.85 || o.d > c.d * 1.18) return;
+        if (dx < bd) { bd = dx; best = o; }
+      });
+      if (best) angles.push(Math.atan2(best.cy - c.cy, best.cx - c.cx));
+    });
+    angles.sort((a, b) => a - b);
+    const ang = (sansRedresser || angles.length < 8) ? 0 : angles[Math.floor(angles.length / 2)];
+    const cosA = Math.cos(ang), sinA = Math.sin(ang), mx = w / 2, my = h / 2;
+    // positions redressées pour le regroupement ; positions d'origine pour la mesure
+    cands.forEach(c => {
+      c.ox = c.cx; c.oy = c.cy;
+      const X = c.cx - mx, Y = c.cy - my;
+      c.cx = mx + X * cosA + Y * sinA; c.cy = my - X * sinA + Y * cosA;
+    });
+    const versImage = (x, y) => { const X = x - mx, Y = y - my; return { x: mx + X * cosA - Y * sinA, y: my + X * sinA + Y * cosA }; };
+
+    // taille des cases : celle qui forme le plus de lignes complètes de nbCols cases
+    const grouperLignes = (liste, dRef) => {
+      const L = [];
+      liste.slice().sort((a, b) => a.cy - b.cy).forEach(b => {
+        const l = L.find(x => Math.abs(x.y - b.cy) < dRef * 0.7);
+        if (l) { l.b.push(b); l.y = l.b.reduce((s, x) => s + x.cy, 0) / l.b.length; }
+        else L.push({ y: b.cy, b: [b] });
+      });
+      return L;
+    };
+    const tailles = cands.map(c => c.d).sort((a, b) => a - b);
+    let dTyp = tailles[Math.floor(tailles.length / 2)], meilleurScore = -1;
+    tailles.forEach(t => {
+      const sel = cands.filter(c => c.d >= t * 0.8 && c.d <= t * 1.25);
+      if (sel.length < nbCols * 2) return;
+      const score = grouperLignes(sel, t).filter(l => l.b.length === nbCols).length;
+      if (score > meilleurScore || (score === meilleurScore && t > dTyp)) { meilleurScore = score; dTyp = t; }
+    });
+    // cases de la bonne taille ; deux morceaux au même endroit (anneau + point) = une seule case
+    const cases = [];
+    cands.filter(c => c.d >= dTyp * 0.75 && c.d <= dTyp * 1.33).sort((a, b) => b.d - a.d).forEach(c => {
+      if (!cases.some(o => Math.abs(o.cx - c.cx) < dTyp * 0.45 && Math.abs(o.cy - c.cy) < dTyp * 0.45)) cases.push(c);
+    });
+    const lignes = grouperLignes(cases, dTyp);
+
+    // colonnes : positions médianes dans les lignes complètes
+    const completes = lignes.filter(l => l.b.length === nbCols).map(l => l.b.slice().sort((a, b) => a.cx - b.cx));
+    if (completes.length < 3) return { erreur: "La grille de la fiche n'a pas été reconnue (lignes de " + nbCols + " cases introuvables)." };
+    const col = Array.from({ length: nbCols }, (_, k) => { const v = completes.map(t => t[k].cx).sort((a, b) => a - b); return v[Math.floor(v.length / 2)]; });
+    let pas = Infinity;
+    for (let k = 1; k < nbCols; k++) pas = Math.min(pas, col[k] - col[k - 1]);
+    const candidates = lignes.map(l => {
+      const pos = new Array(nbCols).fill(null);
+      l.b.forEach(b => {
+        let k = 0;
+        for (let kk = 1; kk < nbCols; kk++) if (Math.abs(b.cx - col[kk]) < Math.abs(b.cx - col[k])) k = kk;
+        if (Math.abs(b.cx - col[k]) < pas * 0.3 && !pos[k]) pos[k] = b;
+      });
+      return { y: l.y, pos, n: pos.filter(Boolean).length };
+    });
+    const pleines = candidates.filter(l => l.n === nbCols).sort((a, b) => a.y - b.y);
+    const ecarts = [];
+    for (let i = 1; i < pleines.length; i++) ecarts.push(pleines[i].y - pleines[i - 1].y);
+    ecarts.sort((a, b) => a - b);
+    const pasY = ecarts.length ? ecarts[Math.floor(ecarts.length / 2)] : dTyp * 3;
+    const surLaGrille = (y) => pleines.some(p => { const k = Math.round(Math.abs(y - p.y) / pasY); return k >= 1 && k <= 3 && Math.abs(Math.abs(y - p.y) - k * pasY) < pasY * 0.25; });
+    const haut = pleines.length ? pleines[0].y - pasY * 1.3 : -Infinity, bas = pleines.length ? pleines[pleines.length - 1].y + pasY * 1.3 : Infinity;
+    const minPartiel = nbCols >= 6 ? Math.ceil(nbCols * 0.6) : Math.max(2, nbCols - 1);
+    // grille large (8 cases) : 4 cases alignées suffisent ; grille de 3 : ligne partielle seulement sur le pas du tableau
+    const retenues = candidates.filter(l => l.n === nbCols ||
+      (nbCols >= 6 ? l.n >= minPartiel : (l.n >= minPartiel && l.y > haut && l.y < bas && surLaGrille(l.y)))).sort((a, b) => a.y - b.y);
+
+    // noircissement de l'intérieur de chaque case
+    const pixels = (x, y, r0, r1) => {
+      const out = [];
+      for (let dy = -r1; dy <= r1; dy++) for (let dx = -r1; dx <= r1; dx++) {
+        const q = dx * dx + dy * dy;
+        if (q > r1 * r1 || q < r0 * r0) continue;
+        const X = Math.round(x + dx), Y = Math.round(y + dy);
+        if (X >= 0 && Y >= 0 && X < w && Y < h) out.push(g[Y * w + X]);
+      }
+      return out.sort((a, b) => a - b);
+    };
+    const interieur = (x, y) => {
+      const rc = Math.max(1.5, dTyp * 0.22);
+      const centre = pixels(x, y, 0, rc);
+      const tout = pixels(x, y, 0, dTyp * 0.6);
+      const papier = pixels(x, y, dTyp * 0.75, dTyp * 1.1);
+      if (!centre.length || !papier.length || !tout.length) return 0;
+      const moyC = centre.reduce((s, v) => s + v, 0) / centre.length;
+      const bg = papier[Math.floor(papier.length * 0.85)];
+      const encre = Math.min(tout[Math.floor(tout.length * 0.05)], bg - 40);
+      const relatif = Math.max(0, Math.min(1, (bg - moyC) / Math.max(30, bg - encre)));
+      // croix / coche : part de pixels sombres à l'intérieur (bord de la case exclu)
+      const a = dTyp * 0.3;
+      const trace = sombreDans(x - a, y - a, x + a, y + a);
+      return forme === "carre" ? Math.max(relatif, Math.min(1, trace * 2.2)) : relatif;
+    };
+    const resultat = retenues.map(l => {
+      const taux = col.map((cx, k) => {
+        if (l.pos[k]) return interieur(l.pos[k].ox, l.pos[k].oy);
+        const q = versImage(cx, l.y); return interieur(q.x, q.y);
+      });
+      return { taux };
+    });
+    const completude = retenues.length ? retenues.reduce((a, l) => a + l.n, 0) / (retenues.length * nbCols) : 0;
+    return { lignes: resultat, trouvees: resultat.length, completude };
+  }
+
+  /* essaie plusieurs résolutions de travail et garde la lecture la plus cohérente */
+  function lireGrilleCases(img, nbCols, forme, attendues) {
+    let meilleur = null, meilleurScore = -Infinity;
+    [1600, 1300, 2000, 1100].forEach(cible => [false, true].forEach(sansRedresser => {
+      const r = lireGrilleCasesA(img, nbCols, forme, cible, sansRedresser);
+      if (r.erreur) { if (!meilleur) meilleur = r; return; }
+      const nets = r.lignes.reduce((s, l) => { const t = l.taux.slice().sort((a, b) => b - a); return s + (t[0] - (t[1] || 0)); }, 0);
+      const q = r.completude || 0;
+      const score = (attendues ? -Math.abs(r.trouvees - attendues) * 10 : r.trouvees * 2 * q * q) + nets / Math.max(1, r.trouvees) + q;
+      if (score > meilleurScore) { meilleurScore = score; meilleur = r; }
+    }));
+    return meilleur;
+  }
+
+  /* fiche individuelle : lignes de 3 bulles, une seule cochée par ligne */
+  function lireFicheBulles(img, nbLignes) {
+    const r = lireGrilleCases(img, 3, null, nbLignes);
+    if (r.erreur) return r;
+    const lignes = r.lignes.map(l => {
+      const taux = l.taux;
+      const max = Math.max.apply(null, taux), idx = taux.indexOf(max);
+      const second = taux.slice().sort((a, b) => b - a)[1];
+      const choix = max >= 0.45 ? idx : null;
+      const doute = choix === null ? max >= 0.3 : (second >= 0.4 || max - second < 0.25);
+      return { taux, choix, doute };
+    });
+    return { lignes: nbLignes ? lignes.slice(0, nbLignes) : lignes, trouvees: lignes.length, attendues: nbLignes || lignes.length };
+  }
+
+  /* fiche collective : lignes de 8 cases (équipe 1 puis équipe 2), plusieurs cases possibles */
+  function lireFicheCollectiveCases(img) {
+    const r = lireGrilleCases(img, 8, "carre");
+    if (r.erreur) return r;
+    const lignes = r.lignes.map(l => ({
+      taux: l.taux,
+      coche: l.taux.map(t => t >= 0.4),
+      doute: l.taux.map(t => t >= 0.25 && t < 0.55)
+    }));
+    return { lignes, trouvees: lignes.length };
+  }
+
   function analyserImage(img) {
     const gr = toGray(img, 1400);
+    // seuillage adaptatif (moyenne locale) : une ombre ou un éclairage inégal
+    // ne noircit plus toute une moitié de la photo
     const seuil = otsu(gr.g);
     gr.bin = new Uint8Array(gr.w * gr.h);
-    for (let i = 0; i < gr.g.length; i++) gr.bin[i] = gr.g[i] < seuil ? 1 : 0;
+    {
+      const w = gr.w, h = gr.h, g = gr.g, I = new Float64Array((w + 1) * (h + 1));
+      for (let y = 0; y < h; y++) {
+        let s = 0;
+        for (let x = 0; x < w; x++) { s += g[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + s; }
+      }
+      const R = Math.max(20, Math.round(w / 22));
+      for (let y = 0; y < h; y++) {
+        const y0 = Math.max(0, y - R), y1 = Math.min(h, y + R + 1);
+        for (let x = 0; x < w; x++) {
+          const x0 = Math.max(0, x - R), x1 = Math.min(w, x + R + 1);
+          const m = (I[y1 * (w + 1) + x1] - I[y0 * (w + 1) + x1] - I[y1 * (w + 1) + x0] + I[y0 * (w + 1) + x0]) / ((x1 - x0) * (y1 - y0));
+          const v = g[y * w + x];
+          gr.bin[y * w + x] = (v < m * 0.78 && v < m - 25) || v < Math.min(seuil, 60) ? 1 : 0;
+        }
+      }
+    }
 
     const W = gr.w, H2 = gr.h, qx = Math.round(W * 0.42), qy = Math.round(H2 * 0.42);
     const coins = [
@@ -19258,6 +20045,18 @@ body.printing-sheets #sheet-zone{display:block;}
     const hauteur = Math.hypot(coins[3].cx - coins[0].cx, coins[3].cy - coins[0].cy);
     const type = largeur >= hauteur ? "ind" : "col";
     const G = type === "ind" ? G_IND : G_COL;
+    {
+      const tl = coins.map(c => c.taille), tmin = Math.min.apply(null, tl), tmax = Math.max.apply(null, tl);
+      const mc = mkCenters(G), attendu = (mc[1].x - mc[0].x) / (mc[3].y - mc[0].y);
+      const largeur2 = Math.hypot(coins[2].cx - coins[3].cx, coins[2].cy - coins[3].cy);
+      const hauteur2 = Math.hypot(coins[2].cx - coins[1].cx, coins[2].cy - coins[1].cy);
+      const mesure = (largeur + largeur2) / (hauteur + hauteur2);
+      const aireRep = tmax * tmax, aireFeuille = largeur * hauteur;
+      if (tmax > tmin * 2 || mesure < attendu * 0.75 || mesure > attendu * 1.33 ||
+          Math.min(largeur, largeur2) < Math.max(largeur, largeur2) * 0.7 ||
+          Math.min(hauteur, hauteur2) < Math.max(hauteur, hauteur2) * 0.7 || aireRep > aireFeuille * 0.02)
+        return { erreur: "Les 4 repères noirs de la grille terrain ne sont pas cohérents." };
+    }
     const Hm = homographie(mkCenters(G), coins.map(c => ({ x: c.cx, y: c.cy })));
     if (!Hm) return { erreur: "Impossible de redresser l'image." };
     return { type, gr, H: Hm, G };
@@ -19282,8 +20081,11 @@ body.printing-sheets #sheet-zone{display:block;}
         const max = Math.max.apply(null, taux);
         const idx = taux.indexOf(max);
         const second = taux.slice().sort((a, b2) => b2 - a)[1];
-        if (max >= 0.35 && max - second >= 0.12) { scores[cp.id] = idx; vide = false; }
-        else if (max >= 0.35) { scores[cp.id] = idx; doutes.push(cp.id); vide = false; }
+        if (max >= 0.15 && max - second >= 0.1) {
+          scores[cp.id] = idx; vide = false;
+          if (max < 0.22 || second >= 0.15) doutes.push(cp.id);
+        }
+        else if (max >= 0.15) { scores[cp.id] = idx; doutes.push(cp.id); vide = false; }
       });
       lignes.push({ index: i, scores, doutes, vide });
     }
@@ -19297,7 +20099,7 @@ body.printing-sheets #sheet-zone{display:block;}
       [0, 1].forEach(e => {
         COL_KEYS.forEach((k, ki) => {
           const b = colBubble(i, e, ki);
-          row[e ? "e2" : "e1"][k] = tauxBulle(r.gr, r.H, b.x, b.y, G_COL.r) >= 0.4;
+          row[e ? "e2" : "e1"][k] = tauxBulle(r.gr, r.H, b.x, b.y, G_COL.r) >= 0.2;
         });
       });
       rows.push(row);
@@ -19307,6 +20109,14 @@ body.printing-sheets #sheet-zone{display:block;}
 
   /* ---------- page « Grilles terrain » ---------- */
   let scanResultat = null;   // résultat en attente de validation
+  let dernierImport = null;  // état avant le dernier import appliqué (↩ annuler)
+  function memoImport(cl) {
+    dernierImport = {
+      cl, clId: cl.id,
+      scores: cl.eleves.map(e => ({ e, id: e.id, s: JSON.parse(JSON.stringify(e.scores || {})) })),
+      collectif: JSON.parse(JSON.stringify(cl.collectif || null))
+    };
+  }
   let scanOutId = "scan-out";     // conteneur de vérification
   let scanEtatId = "scan-etat";   // ligne d'état
 
@@ -19324,7 +20134,11 @@ body.printing-sheets #sheet-zone{display:block;}
           <button class="btn btn-primary" id="${hostId}-print">🖨 Imprimer la grille</button>
           <input type="file" id="${hostId}-file" accept="image/*" hidden>
           <button class="btn btn-amber" id="${hostId}-scan">📷 Importer la photo remplie</button>
+          <button class="btn" id="${hostId}-undo" ${dernierImport && dernierImport.clId === cl.id ? "" : "hidden"}>↩ Annuler le dernier import</button>
+          ${type === "ind" ? `<button class="btn" id="${hostId}-raz" title="Remet à vide le diagnostic individuel de tous les élèves de la classe">🧹 Effacer tous les diagnostics</button>` : ""}
         </div>
+        <p class="hint" style="margin:8px 0 0;">📷 Accepte la <b>grille terrain</b> (4 carrés noirs) <b>ou</b> la photo de la ${type === "ind"
+          ? "<b>fiche de diagnostic individuel</b> imprimée d'un élève" : "<b>fiche collective</b> imprimée (tableau des échanges, cases cochées ou croix)"}.</p>
         <div class="hint" id="${hostId}-etat"></div>
       </div>
       <div id="${hostId}-out"></div>`;
@@ -19332,6 +20146,24 @@ body.printing-sheets #sheet-zone{display:block;}
     $(hostId + "-print").onclick = () => {
       if (type === "ind" && !cl.eleves.length) { toast("Ajoutez d'abord des élèves"); return; }
       imprimerFeuilles(type, cl);
+    };
+    $(hostId + "-undo").onclick = () => {
+      if (!dernierImport || dernierImport.clId !== cl.id) return;
+      confirmModal("Annuler le dernier import", "Les notes et la grille collective reviennent à leur état d'avant le dernier import de photo. Continuer ?", "Annuler l'import", () => {
+        dernierImport.scores.forEach(x => { const e = cl.eleves.find(y => y.id === x.id); if (e) e.scores = x.s; });
+        if (dernierImport.collectif) cl.collectif = dernierImport.collectif;
+        dernierImport = null; scanResultat = null;
+        save(); toast("Dernier import annulé"); render();
+      });
+    };
+    if ($(hostId + "-raz")) $(hostId + "-raz").onclick = () => {
+      const n = cl.eleves.filter(eleveEvalue).length;
+      if (!n) { toast("Aucun élève n'a de diagnostic individuel"); return; }
+      confirmModal("Effacer tous les diagnostics", "Le diagnostic individuel de " + n + " élève(s) de la classe « " + cl.nom + " » sera remis à vide. Continuer ?", "Effacer", () => {
+        memoImport(cl);
+        cl.eleves.forEach(e => { e.scores = {}; });
+        save(); toast(n + " diagnostic(s) effacé(s) — « ↩ Annuler le dernier import » permet de revenir en arrière"); render();
+      });
     };
     $(hostId + "-scan").onclick = () => {
       scanOutId = hostId + "-out";
@@ -19353,8 +20185,32 @@ body.printing-sheets #sheet-zone{display:block;}
     lecteur.onload = () => {
       const img = new Image();
       img.onload = () => {
+        // 1) fiche de diagnostic individuel imprimée (bulles en lignes de 3, sans carrés noirs)
+        const fb = lireFicheBulles(img, COMPETENCES.length);
+        if (!fb.erreur && fb.trouvees >= Math.max(3, COMPETENCES.length - 2)) {
+          scanResultat = { type: "fiche", data: fb };
+          $(scanEtatId).textContent = "Fiche individuelle détectée — " + Math.min(fb.trouvees, COMPETENCES.length) + " / " +
+            COMPETENCES.length + " compétence(s) lue(s). Vérifiez ci-dessous avant d'appliquer.";
+          afficherVerification(cl);
+          if (input) input.value = "";
+          return;
+        }
+        // 2) fiche collective imprimée (lignes de 8 cases : équipe 1 puis équipe 2)
+        const fc = lireFicheCollectiveCases(img);
+        if (!fc.erreur && fc.trouvees >= 4) {
+          scanResultat = { type: "fichecol", data: fc };
+          $(scanEtatId).textContent = "Fiche collective détectée — " + fc.trouvees + " échange(s) lu(s). Vérifiez ci-dessous avant d'appliquer.";
+          afficherVerification(cl);
+          if (input) input.value = "";
+          return;
+        }
+        // 3) grille terrain à 4 repères noirs
         const r = analyserImage(img);
-        if (r.erreur) { $(scanEtatId).textContent = "⚠ " + r.erreur; if (input) input.value = ""; return; }
+        if (r.erreur) {
+          $(scanEtatId).textContent = "⚠ Photo non reconnue : ni fiche individuelle, ni fiche collective, ni grille terrain. " +
+            "Photographiez le tableau entier, à plat, bien éclairé et d'assez près (les cases doivent être nettes).";
+          if (input) input.value = ""; return;
+        }
         scanResultat = r.type === "ind"
           ? { type: "ind", data: lireFeuilleIndividuelle(r) }
           : { type: "col", data: lireFeuilleCollective(r) };
@@ -19396,6 +20252,154 @@ body.printing-sheets #sheet-zone{display:block;}
   function afficherVerification(cl) {
     const out = $(scanOutId);
     if (!scanResultat) { out.innerHTML = ""; return; }
+
+    if (scanResultat.type === "fichecol") {
+      const d = scanResultat.data;
+      const co = cl.collectif;
+      const titres = (() => {
+        const th = [...document.querySelectorAll(".rally-table thead tr:nth-child(2) th")].map(x => x.textContent.trim());
+        return th.length >= 8 ? th.slice(0, 4) : ["Faute", "Niveau 1", "Niveau 2", "Niveau 3"];
+      })();
+      const lignes = d.lignes.map(l => ({ coche: l.coche.slice(), doute: l.doute.slice(), taux: l.taux }));
+      let dernier = -1;
+      lignes.forEach((l, i) => { if (l.coche.some(Boolean)) dernier = i; });
+      const derniereSaisie = (() => { let k = 0; co.rows.forEach((r, i) => { if (COL_KEYS.some(x => r.e1[x] || r.e2[x])) k = i + 1; }); return k; })();
+      out.innerHTML = `
+        <div class="card">
+          <div class="card-title">Vérification — fiche collective
+            <span class="sub">${d.trouvees} ligne(s) lue(s) · ${dernier + 1} échange(s) renseigné(s)</span></div>
+          <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px;">
+            <div class="field"><label for="scan-debut">1re ligne de la photo = échange n°</label>
+              <input class="input" id="scan-debut" type="number" min="1" value="1" style="width:110px;"></div>
+            <button class="btn btn-sm" id="scan-suite" type="button" title="Pour une 2e page de fiche">À la suite des ${derniereSaisie} échange(s) déjà saisis</button>
+            <span style="flex:1"></span>
+            <button class="btn btn-primary" id="scan-apply">✔ Appliquer à la grille collective</button>
+            <button class="btn" id="scan-cancel">Annuler</button>
+          </div>
+          <div class="table-wrap"><table>
+            <thead>
+              <tr><th rowspan="2">Échange</th><th colspan="4" class="eq1" style="text-align:center;">Équipe 1</th><th colspan="4" class="eq2" style="text-align:center;">Équipe 2</th></tr>
+              <tr>${titres.map(t => `<th style="text-align:center;">${esc(t)}</th>`).join("")}${titres.map(t => `<th style="text-align:center;">${esc(t)}</th>`).join("")}</tr>
+            </thead>
+            <tbody id="scan-col-body">${lignes.map((l, i) => i > dernier ? "" : `<tr>
+              <td class="scan-num"><b>${i + 1}</b></td>
+              ${l.coche.map((c, k) => `<td style="text-align:center;${l.doute[k] ? "background:var(--inter-soft);" : ""}">
+                <input type="checkbox" data-l="${i}" data-k="${k}" ${c ? "checked" : ""} aria-label="Échange ${i + 1}, case ${k + 1}"></td>`).join("")}
+            </tr>`).join("") || `<tr><td colspan="9" class="empty">Aucune case cochée n'a été lue.</td></tr>`}</tbody>
+          </table></div>
+          <p class="hint">Les cases sur fond orange sont incertaines (trait léger, croix débordante…) : cochez ou décochez-les avant d'appliquer.
+            Les lignes vides en fin de fiche sont ignorées. Pour une fiche de plusieurs pages, importez chaque page et indiquez le numéro de son premier échange.</p>
+        </div>`;
+      const renum = () => {
+        const deb = Math.max(1, Number($("scan-debut").value) || 1);
+        out.querySelectorAll(".scan-num").forEach((td, i) => { td.innerHTML = "<b>" + (deb + i) + "</b>"; });
+      };
+      $("scan-debut").oninput = renum;
+      $("scan-suite").onclick = () => { $("scan-debut").value = derniereSaisie + 1; renum(); };
+      out.querySelectorAll('#scan-col-body input[type="checkbox"]').forEach(cb => cb.onchange = () => {
+        lignes[Number(cb.dataset.l)].coche[Number(cb.dataset.k)] = cb.checked;
+        cb.closest("td").style.background = "";
+      });
+      $("scan-cancel").onclick = () => { scanResultat = null; afficherVerification(cl); $(scanEtatId).textContent = ""; };
+      $("scan-apply").onclick = () => {
+        memoImport(cl);
+        const deb = Math.max(1, Number($("scan-debut").value) || 1) - 1;
+        let n = 0;
+        for (let i = 0; i <= dernier; i++) {
+          while (co.rows.length <= deb + i) co.rows.push(emptyCollectif().rows[0]);
+          const row = co.rows[deb + i];
+          COL_KEYS.forEach((key, k) => { row.e1[key] = !!lignes[i].coche[k]; row.e2[key] = !!lignes[i].coche[k + 4]; });
+          n++;
+        }
+        save(); scanResultat = null; $(scanEtatId).textContent = "";
+        toast(n + " échange(s) appliqué(s) à la grille collective (n° " + (deb + 1) + " à " + (deb + n) + ")");
+        render();
+      };
+      return;
+    }
+
+    if (scanResultat.type === "fiche") {
+      const d = scanResultat.data;
+      const vals = COMPETENCES.map((cp, i) => d.lignes[i] ? d.lignes[i].choix : null);
+      const doutes = COMPETENCES.map((cp, i) => !d.lignes[i] || d.lignes[i].doute || d.lignes[i].choix === null);
+      // élève proposé : jamais un élève déjà évalué (on n'écrase pas une fiche précédente) ;
+      // la fiche affichée à l'écran si elle est vierge, sinon le premier élève non évalué
+      const ficheVue = ficheEleveId && cl.eleves.find(e => e.id === ficheEleveId && !eleveEvalue(e));
+      // par défaut, la fiche est le diagnostic de TOUTE la classe
+      const defaut = d.appliqueA || (cl.eleves.length ? "__classe__" : "");
+      const totalF = () => vals.reduce((s, v) => s + (Number(v) || 0), 0);
+      const copie = (o) => JSON.parse(JSON.stringify(o || {}));
+      const cibles = () => d.appliqueA === "__classe__" ? cl.eleves : cl.eleves.filter(e => e.id === d.appliqueA);
+      const ecrire = () => {
+        cibles().forEach(el => {
+          el.scores = copie(d.avant && d.avant[el.id]);
+          COMPETENCES.forEach((cp, i) => { if (vals[i] !== null && vals[i] !== undefined) el.scores[cp.id] = vals[i]; });
+        });
+        if (d.appliqueA && d.appliqueA !== "__classe__") ficheEleveId = d.appliqueA;
+        save();
+      };
+      const restaurer = () => {
+        Object.keys(d.avant || {}).forEach(id => { const el = cl.eleves.find(e => e.id === id); if (el) el.scores = copie(d.avant[id]); });
+      };
+      const viser = (id) => {
+        restaurer();
+        d.appliqueA = id || null;
+        d.avant = {};
+        cibles().forEach(el => { d.avant[el.id] = copie(el.scores); });
+        ecrire();
+      };
+      if (!d.appliqueA && defaut) { memoImport(cl); viser(defaut); }
+      const nomVise = () => {
+        if (d.appliqueA === "__classe__") return "toute la classe (" + cl.eleves.length + " élèves)";
+        const e = cl.eleves.find(x => x.id === d.appliqueA); return e ? e.nom : "—";
+      };
+      out.innerHTML = `
+        <div class="card">
+          <div class="card-title">Vérification — fiche individuelle
+            <span class="sub">${Math.min(d.trouvees, COMPETENCES.length)} / ${COMPETENCES.length} compétence(s) lue(s)</span></div>
+          ${d.trouvees < COMPETENCES.length ? `<p class="hint" style="color:var(--lacune);">Certaines lignes n'ont pas été lues : complétez-les dans le tableau.</p>` : ""}
+          <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px;">
+            <div class="field" style="min-width:230px;"><label for="scan-eleve">Cette fiche concerne</label>
+              <select class="input" id="scan-eleve"><option value="__classe__" ${d.appliqueA === "__classe__" ? "selected" : ""}>👥 Toute la classe (${cl.eleves.length} élèves)</option>${cl.eleves.map(e => `<option value="${e.id}" ${e.id === d.appliqueA ? "selected" : ""}>${esc(e.nom)}</option>`).join("")}</select></div>
+            <button class="btn btn-primary" id="scan-apply">✔ Terminé — voir l'analyse</button>
+            <button class="btn" id="scan-cancel">Annuler l'import</button>
+          </div>
+          <p class="hint" id="scan-f-ok" style="margin:0 0 10px;color:var(--maitrise);font-weight:600;">✔ Notes enregistrées pour « ${esc(nomVise())} » — le diagnostic et l'analyse didactique sont déjà mis à jour. Changez d'élève ou corrigez une case : c'est enregistré aussitôt.</p>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Compétence observée</th><th style="text-align:center;">Niveau 1 · 0</th><th style="text-align:center;">Niveau 2 · 1</th><th style="text-align:center;">Niveau 3 · 2</th><th>Lu</th></tr></thead>
+            <tbody>${COMPETENCES.map((cp, i) => `<tr${doutes[i] ? ' style="background:var(--inter-soft);"' : ""}>
+              <td><b>${esc(cp.nom)}</b>${doutes[i] ? ' <span class="tag t-inter">à vérifier</span>' : ""}</td>
+              ${[0, 1, 2].map(v => `<td style="text-align:center;"><input type="radio" name="scan-f-${i}" value="${v}" data-i="${i}" ${vals[i] === v ? "checked" : ""} aria-label="${esc(cp.nom)} : ${v}"></td>`).join("")}
+              <td class="muted" style="font-size:.78rem;">${d.lignes[i] ? d.lignes[i].taux.map(t => Math.round(t * 100) + "%").join(" · ") : "non lue"}</td>
+            </tr>`).join("")}</tbody>
+          </table></div>
+          <p style="margin:10px 0 0;">Total lu : <b id="scan-f-total">${totalF()}</b> / 20</p>
+          <p class="hint">Les lignes surlignées sont incertaines (bulle peu remplie, deux bulles ou ligne non lue) : cochez la bonne valeur (c'est enregistré aussitôt).
+            Les pourcentages indiquent le noircissement mesuré de chaque bulle (niveau 1 · 2 · 3).</p>
+        </div>`;
+      out.querySelectorAll('input[type="radio"][name^="scan-f-"]').forEach(r => r.onchange = () => {
+        vals[Number(r.dataset.i)] = Number(r.value);
+        r.closest("tr").style.background = "";
+        $("scan-f-total").textContent = totalF();
+        ecrire();
+      });
+      $("scan-eleve").onchange = () => {
+        viser($("scan-eleve").value);
+        $("scan-f-ok").textContent = "✔ Notes enregistrées pour « " + nomVise() + " » — le diagnostic et l'analyse didactique sont déjà mis à jour.";
+      };
+      $("scan-cancel").onclick = () => {
+        restaurer(); save(); scanResultat = null; afficherVerification(cl); $(scanEtatId).textContent = "";
+        toast("Import annulé : les notes de l'élève sont revenues à leur état précédent"); render();
+      };
+      $("scan-apply").onclick = () => {
+        ecrire();
+        const nom = nomVise();
+        scanResultat = null; $(scanEtatId).textContent = "";
+        toast("Fiche enregistrée pour " + nom + " : " + totalF() + "/20");
+        page = "analyse"; render();
+      };
+      return;
+    }
 
     if (scanResultat.type === "ind") {
       const d = scanResultat.data;
@@ -19456,21 +20460,22 @@ body.printing-sheets #sheet-zone{display:block;}
       $("scan-page").onchange = dessine;
       $("scan-cancel").onclick = () => { scanResultat = null; afficherVerification(cl); $(scanEtatId).textContent = ""; };
       $("scan-apply").onclick = () => {
+        memoImport(cl);
         const numPage = Number($("scan-page").value);   // ne pas masquer la variable « page » de navigation
         const deb = (numPage - 1) * G_IND.rowsPerPage;
-        let n = 0;
-        d.lignes.forEach((ln, i) => {
-          const el = cl.eleves[deb + i];
-          if (!el || ln.vide) return;
-          COMPETENCES.forEach(cp => {
-            if (ln.scores[cp.id] === undefined) return;
-            el.scores[cp.id] = ln.scores[cp.id];
+        const cibles = d.lignes.map((ln, i) => ({ ln, el: cl.eleves[deb + i] }))
+          .filter(x => x.el && COMPETENCES.some(cp => x.ln.scores[cp.id] !== undefined));
+        if (!cibles.length) { toast("Aucune ligne remplie sur cette grille"); return; }
+        const faire = () => {
+          cibles.forEach(({ ln, el }) => {
+            COMPETENCES.forEach(cp => { if (ln.scores[cp.id] !== undefined) el.scores[cp.id] = ln.scores[cp.id]; });
           });
-          n++;
-        });
-        save(); scanResultat = null;
-        toast(n + " élève(s) importé(s) — analyse mise à jour");
-        page = "analyse"; render();
+          save(); scanResultat = null;
+          toast(cibles.length + " élève(s) importé(s) — analyse mise à jour");
+          page = "analyse"; render();
+        };
+        confirmModal("Appliquer la grille terrain", "Cette grille va modifier le diagnostic de " + cibles.length + " élève(s) : " +
+          cibles.map(x => x.el.nom).join(", ") + ". Continuer ?", "Appliquer", faire);
       };
       return;
     }
@@ -19500,6 +20505,7 @@ body.printing-sheets #sheet-zone{display:block;}
     });
     $("scan-cancel").onclick = () => { scanResultat = null; afficherVerification(cl); $(scanEtatId).textContent = ""; };
     $("scan-apply").onclick = () => {
+      memoImport(cl);
       cl.collectif.rows = d.rows.map(r => ({
         e1: Object.assign({}, r.e1), e2: Object.assign({}, r.e2)
       }));
@@ -22660,6 +23666,7 @@ body.printing-sheets #sheet-zone{display:block;}
   function load() {
     try {
       const raw = localStorage.getItem(STORE_KEY);
+      brutConnu = raw;
       if (raw) data = JSON.parse(raw);
     } catch (e) { /* stockage indisponible */ }
     if (!data || !Array.isArray(data.classes)) data = { classes: [], activeId: null };
@@ -22670,11 +23677,12 @@ body.printing-sheets #sheet-zone{display:block;}
     });
   }
 
-  let saveTimer = null;
+  let saveTimer = null, brutConnu = null;
   function save() {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
-      try { localStorage.setItem(STORE_KEY, JSON.stringify(data)); }
+      saveTimer = null;
+      try { const brut = JSON.stringify(data); localStorage.setItem(STORE_KEY, brut); brutConnu = brut; }
       catch (e) { toast("Sauvegarde impossible (stockage plein ou bloqué)"); }
     }, 180);
   }
@@ -23017,7 +24025,22 @@ body.printing-sheets #sheet-zone{display:block;}
     sel.onchange = () => { data.activeId = sel.value; save(); render(); };
   }
 
+  function resynchroniser() {
+    if (saveTimer) return false;          // une sauvegarde locale est en attente : elle prime
+    let brut = null;
+    try { brut = localStorage.getItem(STORE_KEY); } catch (e) { return false; }
+    if (!brut || brut === brutConnu) return false;
+    const actif = data.activeId;
+    load();
+    if (actif && data.classes.some(c => c.id === actif)) data.activeId = actif;
+    return true;
+  }
+  window.addEventListener("storage", (e) => { if (e.key === STORE_KEY && resynchroniser()) render(); });
+  window.addEventListener("focus", () => { if (resynchroniser()) render(); });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && resynchroniser()) render(); });
+
   function render() {
+    resynchroniser();
     renderNav();
     renderClasseSelect();
     const cl = classe();
@@ -23373,6 +24396,7 @@ body.printing-sheets #sheet-zone{display:block;}
         <button class="btn" id="fiche-prev" ${idx === 0 ? "disabled" : ""}>← Précédent</button>
         <button class="btn" id="fiche-next" ${idx === cl.eleves.length - 1 ? "disabled" : ""}>Suivant →</button>
         <span style="flex:1"></span>
+        <button class="btn" id="fiche-raz" ${eleveEvalue(el) ? "" : "disabled"}>🧹 Effacer le diagnostic de cet élève</button>
         <button class="btn btn-primary" id="fiche-print">🖨 Imprimer la fiche</button>
       </div>
 
@@ -23383,6 +24407,9 @@ body.printing-sheets #sheet-zone{display:block;}
         </div>
 
         <table class="fiche-id">
+          <tr>
+            <th>Élève :</th><td colspan="3"><b>${esc(el.nom)}</b></td>
+          </tr>
           <tr>
             <th>Classe :</th><td>${esc(cl.nom)}</td>
             <th>Date :</th><td><input class="fi" id="fi-date" type="date" value="${esc(en.date)}"></td>
@@ -23471,6 +24498,9 @@ body.printing-sheets #sheet-zone{display:block;}
     $("fiche-prev").onclick = () => { ficheEleveId = cl.eleves[idx - 1].id; render(); };
     $("fiche-next").onclick = () => { ficheEleveId = cl.eleves[idx + 1].id; render(); };
     $("fiche-print").onclick = () => { finPrintFeuilles(); window.print(); };
+    $("fiche-raz").onclick = () => confirmModal("Effacer le diagnostic", "Toutes les notes du diagnostic individuel de « " + el.nom + " » seront effacées. Continuer ?", "Effacer", () => {
+      el.scores = {}; save(); toast("Diagnostic de « " + el.nom + " » effacé"); render();
+    });
     $("fi-obs").oninput = () => { el.observations = $("fi-obs").value; save(); };
     $("fi-obj").oninput = () => { el.objectif = $("fi-obj").value; save(); };
     $("fi-date").onchange = () => { en.date = $("fi-date").value; save(); };
@@ -24578,11 +25608,271 @@ body.printing-sheets #sheet-zone{display:block;}
     return n ? sombre / n : 0;
   }
 
+
+  /* ---------- lecture d'une fiche imprimée SANS repères ----------
+     Repère les cases (bulles rondes ou cases carrées) d'un tableau, les range
+     en lignes de « nbCols » cases alignées, puis mesure le noircissement de
+     l'intérieur de chaque case (bulle remplie, croix, coche…).
+     forme : "rond" (fiche individuelle), "carre" (fiche collective) ou null. */
+  function lireGrilleCasesA(img, nbCols, forme, cible, sansRedresser) {
+    const sc = Math.max(0.2, Math.min(3, cible / img.width));
+    const w = Math.round(img.width * sc), h = Math.round(img.height * sc);
+    const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+    const cx0 = cv.getContext("2d"); cx0.imageSmoothingEnabled = true; cx0.imageSmoothingQuality = "high";
+    cx0.drawImage(img, 0, 0, w, h);
+    const d = cx0.getImageData(0, 0, w, h).data;
+    const g = new Float32Array(w * h);
+    for (let i = 0, j = 0; i < d.length; i += 4, j++) g[j] = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+
+    // seuillage adaptatif (moyenne locale) : résiste aux ombres et à l'éclairage inégal
+    const I = new Float64Array((w + 1) * (h + 1));
+    for (let y = 0; y < h; y++) {
+      let s = 0;
+      for (let x = 0; x < w; x++) { s += g[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + s; }
+    }
+    const R = Math.max(6, Math.round(w / 60));
+    const hist = new Array(256).fill(0);
+    for (let i = 0; i < g.length; i += 7) hist[Math.max(0, Math.min(255, g[i] | 0))]++;
+    let cum = 0, papier = 255; const tot = hist.reduce((a, b) => a + b, 0);
+    for (let v = 0; v < 256; v++) { cum += hist[v]; if (cum >= tot * 0.8) { papier = v; break; } }
+    const bin = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const y0 = Math.max(0, y - R), y1 = Math.min(h, y + R + 1);
+      for (let x = 0; x < w; x++) {
+        const x0 = Math.max(0, x - R), x1 = Math.min(w, x + R + 1);
+        const m = (I[y1 * (w + 1) + x1] - I[y0 * (w + 1) + x1] - I[y1 * (w + 1) + x0] + I[y0 * (w + 1) + x0]) / ((x1 - x0) * (y1 - y0));
+        const v = g[y * w + x];
+        bin[y * w + x] = ((v < m - 14 && v < 200) || v < papier * 0.62) ? 1 : 0;
+      }
+    }
+    const sombreDans = (x0, y0, x1, y1) => {
+      let n = 0, s = 0;
+      for (let y = Math.max(0, Math.round(y0)); y <= Math.min(h - 1, Math.round(y1)); y++)
+        for (let x = Math.max(0, Math.round(x0)); x <= Math.min(w - 1, Math.round(x1)); x++) { n++; s += bin[y * w + x]; }
+      return n ? s / n : 0;
+    };
+
+    // composantes connexes de taille et de forme compatibles avec une case
+    const vu = new Uint8Array(w * h);
+    const cands = [];
+    const dmin = w * 0.008, dmax = w * 0.06;
+    for (let yy = 0; yy < h; yy++) for (let xx = 0; xx < w; xx++) {
+      const i0 = yy * w + xx;
+      if (!bin[i0] || vu[i0]) continue;
+      let minx = xx, maxx = xx, miny = yy, maxy = yy, n = 0;
+      const pile = [i0]; vu[i0] = 1;
+      while (pile.length) {
+        const p = pile.pop(); n++;
+        const px = p % w, py = (p - px) / w;
+        if (px < minx) minx = px; if (px > maxx) maxx = px; if (py < miny) miny = py; if (py > maxy) maxy = py;
+        if (px + 1 < w && bin[p + 1] && !vu[p + 1]) { vu[p + 1] = 1; pile.push(p + 1); }
+        if (px > 0 && bin[p - 1] && !vu[p - 1]) { vu[p - 1] = 1; pile.push(p - 1); }
+        if (py + 1 < h && bin[p + w] && !vu[p + w]) { vu[p + w] = 1; pile.push(p + w); }
+        if (py > 0 && bin[p - w] && !vu[p - w]) { vu[p - w] = 1; pile.push(p - w); }
+      }
+      const bw = maxx - minx + 1, bh = maxy - miny + 1;
+      if (bw < dmin || bh < dmin || bw > dmax || bh > dmax) continue;
+      const ratio = bw / bh;
+      if (ratio < 0.72 || ratio > 1.38) continue;
+      if (n / (bw * bh) < 0.12) continue;
+      // forme : une case carrée a des coins occupés, une bulle ronde non
+      const cw = Math.max(1, bw * 0.15), ch = Math.max(1, bh * 0.15);
+      const coins = (sombreDans(minx, miny, minx + cw, miny + ch) + sombreDans(maxx - cw, miny, maxx, miny + ch) +
+                     sombreDans(minx, maxy - ch, minx + cw, maxy) + sombreDans(maxx - cw, maxy - ch, maxx, maxy)) / 4;
+      const rond = coins < 0.3;
+      if (forme === "rond" && !rond) continue;
+      if (forme === "carre") {
+        if (rond) continue;
+        // une case a 4 côtés : bord sombre sur la majeure partie de chaque côté (les chiffres non)
+        const ep = Math.max(1, Math.round(Math.min(bw, bh) * 0.18));
+        const ligneH = (y, x0, x1) => { let m = 0; for (let j = 0; j <= ep; j++) m = Math.max(m, sombreDans(x0, y(j), x1, y(j))); return m; };
+        const ligneV = (x, y0, y1) => { let m = 0; for (let j = 0; j <= ep; j++) m = Math.max(m, sombreDans(x(j), y0, x(j), y1)); return m; };
+        const cotes = [
+          ligneH(j => miny + j, minx + bw * 0.2, maxx - bw * 0.2), ligneH(j => maxy - j, minx + bw * 0.2, maxx - bw * 0.2),
+          ligneV(j => minx + j, miny + bh * 0.2, maxy - bh * 0.2), ligneV(j => maxx - j, miny + bh * 0.2, maxy - bh * 0.2)
+        ];
+        if (Math.min.apply(null, cotes) < 0.6) continue;
+      }
+      cands.push({ cx: (minx + maxx) / 2, cy: (miny + maxy) / 2, d: (bw + bh) / 2 });
+    }
+    if (cands.length < nbCols * 2) return { erreur: "Aucune case reconnue sur la photo." };
+
+    // inclinaison de la feuille : direction médiane entre voisins horizontaux de même taille
+    const angles = [];
+    cands.forEach(c => {
+      let best = null, bd = Infinity;
+      cands.forEach(o => {
+        if (o === c) return;
+        const dx = o.cx - c.cx, dy = o.cy - c.cy;
+        if (dx <= c.d * 2.5 || Math.abs(dy) > dx * 0.21 || o.d < c.d * 0.85 || o.d > c.d * 1.18) return;
+        if (dx < bd) { bd = dx; best = o; }
+      });
+      if (best) angles.push(Math.atan2(best.cy - c.cy, best.cx - c.cx));
+    });
+    angles.sort((a, b) => a - b);
+    const ang = (sansRedresser || angles.length < 8) ? 0 : angles[Math.floor(angles.length / 2)];
+    const cosA = Math.cos(ang), sinA = Math.sin(ang), mx = w / 2, my = h / 2;
+    // positions redressées pour le regroupement ; positions d'origine pour la mesure
+    cands.forEach(c => {
+      c.ox = c.cx; c.oy = c.cy;
+      const X = c.cx - mx, Y = c.cy - my;
+      c.cx = mx + X * cosA + Y * sinA; c.cy = my - X * sinA + Y * cosA;
+    });
+    const versImage = (x, y) => { const X = x - mx, Y = y - my; return { x: mx + X * cosA - Y * sinA, y: my + X * sinA + Y * cosA }; };
+
+    // taille des cases : celle qui forme le plus de lignes complètes de nbCols cases
+    const grouperLignes = (liste, dRef) => {
+      const L = [];
+      liste.slice().sort((a, b) => a.cy - b.cy).forEach(b => {
+        const l = L.find(x => Math.abs(x.y - b.cy) < dRef * 0.7);
+        if (l) { l.b.push(b); l.y = l.b.reduce((s, x) => s + x.cy, 0) / l.b.length; }
+        else L.push({ y: b.cy, b: [b] });
+      });
+      return L;
+    };
+    const tailles = cands.map(c => c.d).sort((a, b) => a - b);
+    let dTyp = tailles[Math.floor(tailles.length / 2)], meilleurScore = -1;
+    tailles.forEach(t => {
+      const sel = cands.filter(c => c.d >= t * 0.8 && c.d <= t * 1.25);
+      if (sel.length < nbCols * 2) return;
+      const score = grouperLignes(sel, t).filter(l => l.b.length === nbCols).length;
+      if (score > meilleurScore || (score === meilleurScore && t > dTyp)) { meilleurScore = score; dTyp = t; }
+    });
+    // cases de la bonne taille ; deux morceaux au même endroit (anneau + point) = une seule case
+    const cases = [];
+    cands.filter(c => c.d >= dTyp * 0.75 && c.d <= dTyp * 1.33).sort((a, b) => b.d - a.d).forEach(c => {
+      if (!cases.some(o => Math.abs(o.cx - c.cx) < dTyp * 0.45 && Math.abs(o.cy - c.cy) < dTyp * 0.45)) cases.push(c);
+    });
+    const lignes = grouperLignes(cases, dTyp);
+
+    // colonnes : positions médianes dans les lignes complètes
+    const completes = lignes.filter(l => l.b.length === nbCols).map(l => l.b.slice().sort((a, b) => a.cx - b.cx));
+    if (completes.length < 3) return { erreur: "La grille de la fiche n'a pas été reconnue (lignes de " + nbCols + " cases introuvables)." };
+    const col = Array.from({ length: nbCols }, (_, k) => { const v = completes.map(t => t[k].cx).sort((a, b) => a - b); return v[Math.floor(v.length / 2)]; });
+    let pas = Infinity;
+    for (let k = 1; k < nbCols; k++) pas = Math.min(pas, col[k] - col[k - 1]);
+    const candidates = lignes.map(l => {
+      const pos = new Array(nbCols).fill(null);
+      l.b.forEach(b => {
+        let k = 0;
+        for (let kk = 1; kk < nbCols; kk++) if (Math.abs(b.cx - col[kk]) < Math.abs(b.cx - col[k])) k = kk;
+        if (Math.abs(b.cx - col[k]) < pas * 0.3 && !pos[k]) pos[k] = b;
+      });
+      return { y: l.y, pos, n: pos.filter(Boolean).length };
+    });
+    const pleines = candidates.filter(l => l.n === nbCols).sort((a, b) => a.y - b.y);
+    const ecarts = [];
+    for (let i = 1; i < pleines.length; i++) ecarts.push(pleines[i].y - pleines[i - 1].y);
+    ecarts.sort((a, b) => a - b);
+    const pasY = ecarts.length ? ecarts[Math.floor(ecarts.length / 2)] : dTyp * 3;
+    const surLaGrille = (y) => pleines.some(p => { const k = Math.round(Math.abs(y - p.y) / pasY); return k >= 1 && k <= 3 && Math.abs(Math.abs(y - p.y) - k * pasY) < pasY * 0.25; });
+    const haut = pleines.length ? pleines[0].y - pasY * 1.3 : -Infinity, bas = pleines.length ? pleines[pleines.length - 1].y + pasY * 1.3 : Infinity;
+    const minPartiel = nbCols >= 6 ? Math.ceil(nbCols * 0.6) : Math.max(2, nbCols - 1);
+    // grille large (8 cases) : 4 cases alignées suffisent ; grille de 3 : ligne partielle seulement sur le pas du tableau
+    const retenues = candidates.filter(l => l.n === nbCols ||
+      (nbCols >= 6 ? l.n >= minPartiel : (l.n >= minPartiel && l.y > haut && l.y < bas && surLaGrille(l.y)))).sort((a, b) => a.y - b.y);
+
+    // noircissement de l'intérieur de chaque case
+    const pixels = (x, y, r0, r1) => {
+      const out = [];
+      for (let dy = -r1; dy <= r1; dy++) for (let dx = -r1; dx <= r1; dx++) {
+        const q = dx * dx + dy * dy;
+        if (q > r1 * r1 || q < r0 * r0) continue;
+        const X = Math.round(x + dx), Y = Math.round(y + dy);
+        if (X >= 0 && Y >= 0 && X < w && Y < h) out.push(g[Y * w + X]);
+      }
+      return out.sort((a, b) => a - b);
+    };
+    const interieur = (x, y) => {
+      const rc = Math.max(1.5, dTyp * 0.22);
+      const centre = pixels(x, y, 0, rc);
+      const tout = pixels(x, y, 0, dTyp * 0.6);
+      const papier = pixels(x, y, dTyp * 0.75, dTyp * 1.1);
+      if (!centre.length || !papier.length || !tout.length) return 0;
+      const moyC = centre.reduce((s, v) => s + v, 0) / centre.length;
+      const bg = papier[Math.floor(papier.length * 0.85)];
+      const encre = Math.min(tout[Math.floor(tout.length * 0.05)], bg - 40);
+      const relatif = Math.max(0, Math.min(1, (bg - moyC) / Math.max(30, bg - encre)));
+      // croix / coche : part de pixels sombres à l'intérieur (bord de la case exclu)
+      const a = dTyp * 0.3;
+      const trace = sombreDans(x - a, y - a, x + a, y + a);
+      return forme === "carre" ? Math.max(relatif, Math.min(1, trace * 2.2)) : relatif;
+    };
+    const resultat = retenues.map(l => {
+      const taux = col.map((cx, k) => {
+        if (l.pos[k]) return interieur(l.pos[k].ox, l.pos[k].oy);
+        const q = versImage(cx, l.y); return interieur(q.x, q.y);
+      });
+      return { taux };
+    });
+    const completude = retenues.length ? retenues.reduce((a, l) => a + l.n, 0) / (retenues.length * nbCols) : 0;
+    return { lignes: resultat, trouvees: resultat.length, completude };
+  }
+
+  /* essaie plusieurs résolutions de travail et garde la lecture la plus cohérente */
+  function lireGrilleCases(img, nbCols, forme, attendues) {
+    let meilleur = null, meilleurScore = -Infinity;
+    [1600, 1300, 2000, 1100].forEach(cible => [false, true].forEach(sansRedresser => {
+      const r = lireGrilleCasesA(img, nbCols, forme, cible, sansRedresser);
+      if (r.erreur) { if (!meilleur) meilleur = r; return; }
+      const nets = r.lignes.reduce((s, l) => { const t = l.taux.slice().sort((a, b) => b - a); return s + (t[0] - (t[1] || 0)); }, 0);
+      const q = r.completude || 0;
+      const score = (attendues ? -Math.abs(r.trouvees - attendues) * 10 : r.trouvees * 2 * q * q) + nets / Math.max(1, r.trouvees) + q;
+      if (score > meilleurScore) { meilleurScore = score; meilleur = r; }
+    }));
+    return meilleur;
+  }
+
+  /* fiche individuelle : lignes de 3 bulles, une seule cochée par ligne */
+  function lireFicheBulles(img, nbLignes) {
+    const r = lireGrilleCases(img, 3, null, nbLignes);
+    if (r.erreur) return r;
+    const lignes = r.lignes.map(l => {
+      const taux = l.taux;
+      const max = Math.max.apply(null, taux), idx = taux.indexOf(max);
+      const second = taux.slice().sort((a, b) => b - a)[1];
+      const choix = max >= 0.45 ? idx : null;
+      const doute = choix === null ? max >= 0.3 : (second >= 0.4 || max - second < 0.25);
+      return { taux, choix, doute };
+    });
+    return { lignes: nbLignes ? lignes.slice(0, nbLignes) : lignes, trouvees: lignes.length, attendues: nbLignes || lignes.length };
+  }
+
+  /* fiche collective : lignes de 8 cases (équipe 1 puis équipe 2), plusieurs cases possibles */
+  function lireFicheCollectiveCases(img) {
+    const r = lireGrilleCases(img, 8, "carre");
+    if (r.erreur) return r;
+    const lignes = r.lignes.map(l => ({
+      taux: l.taux,
+      coche: l.taux.map(t => t >= 0.4),
+      doute: l.taux.map(t => t >= 0.25 && t < 0.55)
+    }));
+    return { lignes, trouvees: lignes.length };
+  }
+
   function analyserImage(img) {
     const gr = toGray(img, 1400);
+    // seuillage adaptatif (moyenne locale) : une ombre ou un éclairage inégal
+    // ne noircit plus toute une moitié de la photo
     const seuil = otsu(gr.g);
     gr.bin = new Uint8Array(gr.w * gr.h);
-    for (let i = 0; i < gr.g.length; i++) gr.bin[i] = gr.g[i] < seuil ? 1 : 0;
+    {
+      const w = gr.w, h = gr.h, g = gr.g, I = new Float64Array((w + 1) * (h + 1));
+      for (let y = 0; y < h; y++) {
+        let s = 0;
+        for (let x = 0; x < w; x++) { s += g[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + s; }
+      }
+      const R = Math.max(20, Math.round(w / 22));
+      for (let y = 0; y < h; y++) {
+        const y0 = Math.max(0, y - R), y1 = Math.min(h, y + R + 1);
+        for (let x = 0; x < w; x++) {
+          const x0 = Math.max(0, x - R), x1 = Math.min(w, x + R + 1);
+          const m = (I[y1 * (w + 1) + x1] - I[y0 * (w + 1) + x1] - I[y1 * (w + 1) + x0] + I[y0 * (w + 1) + x0]) / ((x1 - x0) * (y1 - y0));
+          const v = g[y * w + x];
+          gr.bin[y * w + x] = (v < m * 0.78 && v < m - 25) || v < Math.min(seuil, 60) ? 1 : 0;
+        }
+      }
+    }
 
     const W = gr.w, H2 = gr.h, qx = Math.round(W * 0.42), qy = Math.round(H2 * 0.42);
     const coins = [
@@ -24598,6 +25888,18 @@ body.printing-sheets #sheet-zone{display:block;}
     const hauteur = Math.hypot(coins[3].cx - coins[0].cx, coins[3].cy - coins[0].cy);
     const type = largeur >= hauteur ? "ind" : "col";
     const G = type === "ind" ? G_IND : G_COL;
+    {
+      const tl = coins.map(c => c.taille), tmin = Math.min.apply(null, tl), tmax = Math.max.apply(null, tl);
+      const mc = mkCenters(G), attendu = (mc[1].x - mc[0].x) / (mc[3].y - mc[0].y);
+      const largeur2 = Math.hypot(coins[2].cx - coins[3].cx, coins[2].cy - coins[3].cy);
+      const hauteur2 = Math.hypot(coins[2].cx - coins[1].cx, coins[2].cy - coins[1].cy);
+      const mesure = (largeur + largeur2) / (hauteur + hauteur2);
+      const aireRep = tmax * tmax, aireFeuille = largeur * hauteur;
+      if (tmax > tmin * 2 || mesure < attendu * 0.75 || mesure > attendu * 1.33 ||
+          Math.min(largeur, largeur2) < Math.max(largeur, largeur2) * 0.7 ||
+          Math.min(hauteur, hauteur2) < Math.max(hauteur, hauteur2) * 0.7 || aireRep > aireFeuille * 0.02)
+        return { erreur: "Les 4 repères noirs de la grille terrain ne sont pas cohérents." };
+    }
     const Hm = homographie(mkCenters(G), coins.map(c => ({ x: c.cx, y: c.cy })));
     if (!Hm) return { erreur: "Impossible de redresser l'image." };
     return { type, gr, H: Hm, G };
@@ -24622,8 +25924,11 @@ body.printing-sheets #sheet-zone{display:block;}
         const max = Math.max.apply(null, taux);
         const idx = taux.indexOf(max);
         const second = taux.slice().sort((a, b2) => b2 - a)[1];
-        if (max >= 0.35 && max - second >= 0.12) { scores[cp.id] = idx; vide = false; }
-        else if (max >= 0.35) { scores[cp.id] = idx; doutes.push(cp.id); vide = false; }
+        if (max >= 0.15 && max - second >= 0.1) {
+          scores[cp.id] = idx; vide = false;
+          if (max < 0.22 || second >= 0.15) doutes.push(cp.id);
+        }
+        else if (max >= 0.15) { scores[cp.id] = idx; doutes.push(cp.id); vide = false; }
       });
       lignes.push({ index: i, scores, doutes, vide });
     }
@@ -24637,7 +25942,7 @@ body.printing-sheets #sheet-zone{display:block;}
       [0, 1].forEach(e => {
         COL_KEYS.forEach((k, ki) => {
           const b = colBubble(i, e, ki);
-          row[e ? "e2" : "e1"][k] = tauxBulle(r.gr, r.H, b.x, b.y, G_COL.r) >= 0.4;
+          row[e ? "e2" : "e1"][k] = tauxBulle(r.gr, r.H, b.x, b.y, G_COL.r) >= 0.2;
         });
       });
       rows.push(row);
@@ -24647,6 +25952,14 @@ body.printing-sheets #sheet-zone{display:block;}
 
   /* ---------- page « Grilles terrain » ---------- */
   let scanResultat = null;   // résultat en attente de validation
+  let dernierImport = null;  // état avant le dernier import appliqué (↩ annuler)
+  function memoImport(cl) {
+    dernierImport = {
+      cl, clId: cl.id,
+      scores: cl.eleves.map(e => ({ e, id: e.id, s: JSON.parse(JSON.stringify(e.scores || {})) })),
+      collectif: JSON.parse(JSON.stringify(cl.collectif || null))
+    };
+  }
   let scanOutId = "scan-out";     // conteneur de vérification
   let scanEtatId = "scan-etat";   // ligne d'état
 
@@ -24664,7 +25977,11 @@ body.printing-sheets #sheet-zone{display:block;}
           <button class="btn btn-primary" id="${hostId}-print">🖨 Imprimer la grille</button>
           <input type="file" id="${hostId}-file" accept="image/*" hidden>
           <button class="btn btn-amber" id="${hostId}-scan">📷 Importer la photo remplie</button>
+          <button class="btn" id="${hostId}-undo" ${dernierImport && dernierImport.clId === cl.id ? "" : "hidden"}>↩ Annuler le dernier import</button>
+          ${type === "ind" ? `<button class="btn" id="${hostId}-raz" title="Remet à vide le diagnostic individuel de tous les élèves de la classe">🧹 Effacer tous les diagnostics</button>` : ""}
         </div>
+        <p class="hint" style="margin:8px 0 0;">📷 Accepte la <b>grille terrain</b> (4 carrés noirs) <b>ou</b> la photo de la ${type === "ind"
+          ? "<b>fiche de diagnostic individuel</b> imprimée d'un élève" : "<b>fiche collective</b> imprimée (tableau des échanges, cases cochées ou croix)"}.</p>
         <div class="hint" id="${hostId}-etat"></div>
       </div>
       <div id="${hostId}-out"></div>`;
@@ -24672,6 +25989,24 @@ body.printing-sheets #sheet-zone{display:block;}
     $(hostId + "-print").onclick = () => {
       if (type === "ind" && !cl.eleves.length) { toast("Ajoutez d'abord des élèves"); return; }
       imprimerFeuilles(type, cl);
+    };
+    $(hostId + "-undo").onclick = () => {
+      if (!dernierImport || dernierImport.clId !== cl.id) return;
+      confirmModal("Annuler le dernier import", "Les notes et la grille collective reviennent à leur état d'avant le dernier import de photo. Continuer ?", "Annuler l'import", () => {
+        dernierImport.scores.forEach(x => { const e = cl.eleves.find(y => y.id === x.id); if (e) e.scores = x.s; });
+        if (dernierImport.collectif) cl.collectif = dernierImport.collectif;
+        dernierImport = null; scanResultat = null;
+        save(); toast("Dernier import annulé"); render();
+      });
+    };
+    if ($(hostId + "-raz")) $(hostId + "-raz").onclick = () => {
+      const n = cl.eleves.filter(eleveEvalue).length;
+      if (!n) { toast("Aucun élève n'a de diagnostic individuel"); return; }
+      confirmModal("Effacer tous les diagnostics", "Le diagnostic individuel de " + n + " élève(s) de la classe « " + cl.nom + " » sera remis à vide. Continuer ?", "Effacer", () => {
+        memoImport(cl);
+        cl.eleves.forEach(e => { e.scores = {}; });
+        save(); toast(n + " diagnostic(s) effacé(s) — « ↩ Annuler le dernier import » permet de revenir en arrière"); render();
+      });
     };
     $(hostId + "-scan").onclick = () => {
       scanOutId = hostId + "-out";
@@ -24693,8 +26028,32 @@ body.printing-sheets #sheet-zone{display:block;}
     lecteur.onload = () => {
       const img = new Image();
       img.onload = () => {
+        // 1) fiche de diagnostic individuel imprimée (bulles en lignes de 3, sans carrés noirs)
+        const fb = lireFicheBulles(img, COMPETENCES.length);
+        if (!fb.erreur && fb.trouvees >= Math.max(3, COMPETENCES.length - 2)) {
+          scanResultat = { type: "fiche", data: fb };
+          $(scanEtatId).textContent = "Fiche individuelle détectée — " + Math.min(fb.trouvees, COMPETENCES.length) + " / " +
+            COMPETENCES.length + " compétence(s) lue(s). Vérifiez ci-dessous avant d'appliquer.";
+          afficherVerification(cl);
+          if (input) input.value = "";
+          return;
+        }
+        // 2) fiche collective imprimée (lignes de 8 cases : équipe 1 puis équipe 2)
+        const fc = lireFicheCollectiveCases(img);
+        if (!fc.erreur && fc.trouvees >= 4) {
+          scanResultat = { type: "fichecol", data: fc };
+          $(scanEtatId).textContent = "Fiche collective détectée — " + fc.trouvees + " échange(s) lu(s). Vérifiez ci-dessous avant d'appliquer.";
+          afficherVerification(cl);
+          if (input) input.value = "";
+          return;
+        }
+        // 3) grille terrain à 4 repères noirs
         const r = analyserImage(img);
-        if (r.erreur) { $(scanEtatId).textContent = "⚠ " + r.erreur; if (input) input.value = ""; return; }
+        if (r.erreur) {
+          $(scanEtatId).textContent = "⚠ Photo non reconnue : ni fiche individuelle, ni fiche collective, ni grille terrain. " +
+            "Photographiez le tableau entier, à plat, bien éclairé et d'assez près (les cases doivent être nettes).";
+          if (input) input.value = ""; return;
+        }
         scanResultat = r.type === "ind"
           ? { type: "ind", data: lireFeuilleIndividuelle(r) }
           : { type: "col", data: lireFeuilleCollective(r) };
@@ -24736,6 +26095,154 @@ body.printing-sheets #sheet-zone{display:block;}
   function afficherVerification(cl) {
     const out = $(scanOutId);
     if (!scanResultat) { out.innerHTML = ""; return; }
+
+    if (scanResultat.type === "fichecol") {
+      const d = scanResultat.data;
+      const co = cl.collectif;
+      const titres = (() => {
+        const th = [...document.querySelectorAll(".rally-table thead tr:nth-child(2) th")].map(x => x.textContent.trim());
+        return th.length >= 8 ? th.slice(0, 4) : ["Faute", "Niveau 1", "Niveau 2", "Niveau 3"];
+      })();
+      const lignes = d.lignes.map(l => ({ coche: l.coche.slice(), doute: l.doute.slice(), taux: l.taux }));
+      let dernier = -1;
+      lignes.forEach((l, i) => { if (l.coche.some(Boolean)) dernier = i; });
+      const derniereSaisie = (() => { let k = 0; co.rows.forEach((r, i) => { if (COL_KEYS.some(x => r.e1[x] || r.e2[x])) k = i + 1; }); return k; })();
+      out.innerHTML = `
+        <div class="card">
+          <div class="card-title">Vérification — fiche collective
+            <span class="sub">${d.trouvees} ligne(s) lue(s) · ${dernier + 1} échange(s) renseigné(s)</span></div>
+          <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px;">
+            <div class="field"><label for="scan-debut">1re ligne de la photo = échange n°</label>
+              <input class="input" id="scan-debut" type="number" min="1" value="1" style="width:110px;"></div>
+            <button class="btn btn-sm" id="scan-suite" type="button" title="Pour une 2e page de fiche">À la suite des ${derniereSaisie} échange(s) déjà saisis</button>
+            <span style="flex:1"></span>
+            <button class="btn btn-primary" id="scan-apply">✔ Appliquer à la grille collective</button>
+            <button class="btn" id="scan-cancel">Annuler</button>
+          </div>
+          <div class="table-wrap"><table>
+            <thead>
+              <tr><th rowspan="2">Échange</th><th colspan="4" class="eq1" style="text-align:center;">Équipe 1</th><th colspan="4" class="eq2" style="text-align:center;">Équipe 2</th></tr>
+              <tr>${titres.map(t => `<th style="text-align:center;">${esc(t)}</th>`).join("")}${titres.map(t => `<th style="text-align:center;">${esc(t)}</th>`).join("")}</tr>
+            </thead>
+            <tbody id="scan-col-body">${lignes.map((l, i) => i > dernier ? "" : `<tr>
+              <td class="scan-num"><b>${i + 1}</b></td>
+              ${l.coche.map((c, k) => `<td style="text-align:center;${l.doute[k] ? "background:var(--inter-soft);" : ""}">
+                <input type="checkbox" data-l="${i}" data-k="${k}" ${c ? "checked" : ""} aria-label="Échange ${i + 1}, case ${k + 1}"></td>`).join("")}
+            </tr>`).join("") || `<tr><td colspan="9" class="empty">Aucune case cochée n'a été lue.</td></tr>`}</tbody>
+          </table></div>
+          <p class="hint">Les cases sur fond orange sont incertaines (trait léger, croix débordante…) : cochez ou décochez-les avant d'appliquer.
+            Les lignes vides en fin de fiche sont ignorées. Pour une fiche de plusieurs pages, importez chaque page et indiquez le numéro de son premier échange.</p>
+        </div>`;
+      const renum = () => {
+        const deb = Math.max(1, Number($("scan-debut").value) || 1);
+        out.querySelectorAll(".scan-num").forEach((td, i) => { td.innerHTML = "<b>" + (deb + i) + "</b>"; });
+      };
+      $("scan-debut").oninput = renum;
+      $("scan-suite").onclick = () => { $("scan-debut").value = derniereSaisie + 1; renum(); };
+      out.querySelectorAll('#scan-col-body input[type="checkbox"]').forEach(cb => cb.onchange = () => {
+        lignes[Number(cb.dataset.l)].coche[Number(cb.dataset.k)] = cb.checked;
+        cb.closest("td").style.background = "";
+      });
+      $("scan-cancel").onclick = () => { scanResultat = null; afficherVerification(cl); $(scanEtatId).textContent = ""; };
+      $("scan-apply").onclick = () => {
+        memoImport(cl);
+        const deb = Math.max(1, Number($("scan-debut").value) || 1) - 1;
+        let n = 0;
+        for (let i = 0; i <= dernier; i++) {
+          while (co.rows.length <= deb + i) co.rows.push(emptyCollectif().rows[0]);
+          const row = co.rows[deb + i];
+          COL_KEYS.forEach((key, k) => { row.e1[key] = !!lignes[i].coche[k]; row.e2[key] = !!lignes[i].coche[k + 4]; });
+          n++;
+        }
+        save(); scanResultat = null; $(scanEtatId).textContent = "";
+        toast(n + " échange(s) appliqué(s) à la grille collective (n° " + (deb + 1) + " à " + (deb + n) + ")");
+        render();
+      };
+      return;
+    }
+
+    if (scanResultat.type === "fiche") {
+      const d = scanResultat.data;
+      const vals = COMPETENCES.map((cp, i) => d.lignes[i] ? d.lignes[i].choix : null);
+      const doutes = COMPETENCES.map((cp, i) => !d.lignes[i] || d.lignes[i].doute || d.lignes[i].choix === null);
+      // élève proposé : jamais un élève déjà évalué (on n'écrase pas une fiche précédente) ;
+      // la fiche affichée à l'écran si elle est vierge, sinon le premier élève non évalué
+      const ficheVue = ficheEleveId && cl.eleves.find(e => e.id === ficheEleveId && !eleveEvalue(e));
+      // par défaut, la fiche est le diagnostic de TOUTE la classe
+      const defaut = d.appliqueA || (cl.eleves.length ? "__classe__" : "");
+      const totalF = () => vals.reduce((s, v) => s + (Number(v) || 0), 0);
+      const copie = (o) => JSON.parse(JSON.stringify(o || {}));
+      const cibles = () => d.appliqueA === "__classe__" ? cl.eleves : cl.eleves.filter(e => e.id === d.appliqueA);
+      const ecrire = () => {
+        cibles().forEach(el => {
+          el.scores = copie(d.avant && d.avant[el.id]);
+          COMPETENCES.forEach((cp, i) => { if (vals[i] !== null && vals[i] !== undefined) el.scores[cp.id] = vals[i]; });
+        });
+        if (d.appliqueA && d.appliqueA !== "__classe__") ficheEleveId = d.appliqueA;
+        save();
+      };
+      const restaurer = () => {
+        Object.keys(d.avant || {}).forEach(id => { const el = cl.eleves.find(e => e.id === id); if (el) el.scores = copie(d.avant[id]); });
+      };
+      const viser = (id) => {
+        restaurer();
+        d.appliqueA = id || null;
+        d.avant = {};
+        cibles().forEach(el => { d.avant[el.id] = copie(el.scores); });
+        ecrire();
+      };
+      if (!d.appliqueA && defaut) { memoImport(cl); viser(defaut); }
+      const nomVise = () => {
+        if (d.appliqueA === "__classe__") return "toute la classe (" + cl.eleves.length + " élèves)";
+        const e = cl.eleves.find(x => x.id === d.appliqueA); return e ? e.nom : "—";
+      };
+      out.innerHTML = `
+        <div class="card">
+          <div class="card-title">Vérification — fiche individuelle
+            <span class="sub">${Math.min(d.trouvees, COMPETENCES.length)} / ${COMPETENCES.length} compétence(s) lue(s)</span></div>
+          ${d.trouvees < COMPETENCES.length ? `<p class="hint" style="color:var(--lacune);">Certaines lignes n'ont pas été lues : complétez-les dans le tableau.</p>` : ""}
+          <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px;">
+            <div class="field" style="min-width:230px;"><label for="scan-eleve">Cette fiche concerne</label>
+              <select class="input" id="scan-eleve"><option value="__classe__" ${d.appliqueA === "__classe__" ? "selected" : ""}>👥 Toute la classe (${cl.eleves.length} élèves)</option>${cl.eleves.map(e => `<option value="${e.id}" ${e.id === d.appliqueA ? "selected" : ""}>${esc(e.nom)}</option>`).join("")}</select></div>
+            <button class="btn btn-primary" id="scan-apply">✔ Terminé — voir l'analyse</button>
+            <button class="btn" id="scan-cancel">Annuler l'import</button>
+          </div>
+          <p class="hint" id="scan-f-ok" style="margin:0 0 10px;color:var(--maitrise);font-weight:600;">✔ Notes enregistrées pour « ${esc(nomVise())} » — le diagnostic et l'analyse didactique sont déjà mis à jour. Changez d'élève ou corrigez une case : c'est enregistré aussitôt.</p>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Compétence observée</th><th style="text-align:center;">Niveau 1 · 0</th><th style="text-align:center;">Niveau 2 · 1</th><th style="text-align:center;">Niveau 3 · 2</th><th>Lu</th></tr></thead>
+            <tbody>${COMPETENCES.map((cp, i) => `<tr${doutes[i] ? ' style="background:var(--inter-soft);"' : ""}>
+              <td><b>${esc(cp.nom)}</b>${doutes[i] ? ' <span class="tag t-inter">à vérifier</span>' : ""}</td>
+              ${[0, 1, 2].map(v => `<td style="text-align:center;"><input type="radio" name="scan-f-${i}" value="${v}" data-i="${i}" ${vals[i] === v ? "checked" : ""} aria-label="${esc(cp.nom)} : ${v}"></td>`).join("")}
+              <td class="muted" style="font-size:.78rem;">${d.lignes[i] ? d.lignes[i].taux.map(t => Math.round(t * 100) + "%").join(" · ") : "non lue"}</td>
+            </tr>`).join("")}</tbody>
+          </table></div>
+          <p style="margin:10px 0 0;">Total lu : <b id="scan-f-total">${totalF()}</b> / 20</p>
+          <p class="hint">Les lignes surlignées sont incertaines (bulle peu remplie, deux bulles ou ligne non lue) : cochez la bonne valeur (c'est enregistré aussitôt).
+            Les pourcentages indiquent le noircissement mesuré de chaque bulle (niveau 1 · 2 · 3).</p>
+        </div>`;
+      out.querySelectorAll('input[type="radio"][name^="scan-f-"]').forEach(r => r.onchange = () => {
+        vals[Number(r.dataset.i)] = Number(r.value);
+        r.closest("tr").style.background = "";
+        $("scan-f-total").textContent = totalF();
+        ecrire();
+      });
+      $("scan-eleve").onchange = () => {
+        viser($("scan-eleve").value);
+        $("scan-f-ok").textContent = "✔ Notes enregistrées pour « " + nomVise() + " » — le diagnostic et l'analyse didactique sont déjà mis à jour.";
+      };
+      $("scan-cancel").onclick = () => {
+        restaurer(); save(); scanResultat = null; afficherVerification(cl); $(scanEtatId).textContent = "";
+        toast("Import annulé : les notes de l'élève sont revenues à leur état précédent"); render();
+      };
+      $("scan-apply").onclick = () => {
+        ecrire();
+        const nom = nomVise();
+        scanResultat = null; $(scanEtatId).textContent = "";
+        toast("Fiche enregistrée pour " + nom + " : " + totalF() + "/20");
+        page = "analyse"; render();
+      };
+      return;
+    }
 
     if (scanResultat.type === "ind") {
       const d = scanResultat.data;
@@ -24796,21 +26303,22 @@ body.printing-sheets #sheet-zone{display:block;}
       $("scan-page").onchange = dessine;
       $("scan-cancel").onclick = () => { scanResultat = null; afficherVerification(cl); $(scanEtatId).textContent = ""; };
       $("scan-apply").onclick = () => {
+        memoImport(cl);
         const numPage = Number($("scan-page").value);   // ne pas masquer la variable « page » de navigation
         const deb = (numPage - 1) * G_IND.rowsPerPage;
-        let n = 0;
-        d.lignes.forEach((ln, i) => {
-          const el = cl.eleves[deb + i];
-          if (!el || ln.vide) return;
-          COMPETENCES.forEach(cp => {
-            if (ln.scores[cp.id] === undefined) return;
-            el.scores[cp.id] = ln.scores[cp.id];
+        const cibles = d.lignes.map((ln, i) => ({ ln, el: cl.eleves[deb + i] }))
+          .filter(x => x.el && COMPETENCES.some(cp => x.ln.scores[cp.id] !== undefined));
+        if (!cibles.length) { toast("Aucune ligne remplie sur cette grille"); return; }
+        const faire = () => {
+          cibles.forEach(({ ln, el }) => {
+            COMPETENCES.forEach(cp => { if (ln.scores[cp.id] !== undefined) el.scores[cp.id] = ln.scores[cp.id]; });
           });
-          n++;
-        });
-        save(); scanResultat = null;
-        toast(n + " élève(s) importé(s) — analyse mise à jour");
-        page = "analyse"; render();
+          save(); scanResultat = null;
+          toast(cibles.length + " élève(s) importé(s) — analyse mise à jour");
+          page = "analyse"; render();
+        };
+        confirmModal("Appliquer la grille terrain", "Cette grille va modifier le diagnostic de " + cibles.length + " élève(s) : " +
+          cibles.map(x => x.el.nom).join(", ") + ". Continuer ?", "Appliquer", faire);
       };
       return;
     }
@@ -24840,6 +26348,7 @@ body.printing-sheets #sheet-zone{display:block;}
     });
     $("scan-cancel").onclick = () => { scanResultat = null; afficherVerification(cl); $(scanEtatId).textContent = ""; };
     $("scan-apply").onclick = () => {
+      memoImport(cl);
       cl.collectif.rows = d.rows.map(r => ({
         e1: Object.assign({}, r.e1), e2: Object.assign({}, r.e2)
       }));
