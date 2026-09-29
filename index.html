@@ -42324,10 +42324,26 @@ EPS.ui.analysis = {
 window.EPS = window.EPS || {};
 EPS.ui = EPS.ui || {};
 
+EPS.OTC_VITESSE = {
+  "1AC": ["seq1", "seq2"], "2AC": ["seq2", "seq3"], "3AC": ["seq1", "seq4"],
+  "TC": ["seq3", "seq2"], "1BAC": ["seq1", "seq3"], "2BAC": ["seq4", "seq3"]
+};
+/* séquences retenues pour le cycle : choix de l'enseignant, sinon celles de l'OTC du niveau, sinon toutes */
+EPS.sequencesRetenues = function (classe, apsRef) {
+  const ids = apsRef.sequences.map(s => s.id);
+  if (classe && Array.isArray(classe.sequencesChoisies)) {
+    const ok = classe.sequencesChoisies.filter(id => ids.indexOf(id) !== -1);
+    if (ok.length) return ok;
+  }
+  const o = classe && EPS.OTC_VITESSE[classe.niveauScolaire];
+  return o ? o.slice() : ids;
+};
 EPS.ui.priority = {
   async render(container) {
     const classeId = EPS.state.classeId;
     const apsRef = EPS.reference.aps[EPS.state.apsId];
+    const classeSel = await EPS.db.get("classes", classeId);
+    const retenues = EPS.sequencesRetenues(classeSel, apsRef);
     let sessions = await EPS.engines.diagnostic.getSessionsForClasse(classeId);
     sessions.sort((a, b) => b.createdAt - a.createdAt);
     if (!sessions.length) {
@@ -42355,7 +42371,16 @@ EPS.ui.priority = {
             </tr>`).join("")}
           </tbody>
         </table>
-        <p class="hint">Plus la barre est longue, plus la séquence doit être travaillée en priorité dans le cycle. La séquence 1 (Départ) reste toujours présente même si elle est peu prioritaire.</p>
+        <p class="hint">Plus la barre est longue, plus la séquence doit être travaillée en priorité dans le cycle.</p>
+      </div>
+
+      <div class="card no-print" style="border:2px solid var(--primary, #1e3a5f);">
+        <div class="card-title">✅ Séquences retenues pour le cycle — à vous de choisir</div>
+        <p style="margin:0 0 6px;">${retenues.map((id, i) => { const s = apsRef.sequences.find(x => x.id === id); return `<b>${i + 1}. ${s ? s.principe : id}</b>`; }).join(" · ")}</p>
+        <p class="hint" style="margin:0;">Cliquez sur la carte d'une séquence (ou sur sa case) pour la retenir ou la retirer : <b>1 à 4 séquences</b>.
+          ${Array.isArray(classeSel && classeSel.sequencesChoisies) && classeSel.sequencesChoisies.length ? "Sélection personnalisée." : (classeSel && EPS.OTC_VITESSE[classeSel.niveauScolaire] ? "Pré-sélection : séquences de l'OTC " + classeSel.niveauScolaire + " (modifiable)." : "Pré-sélection : toutes les séquences.")}
+          Le projet de cycle est construit uniquement sur les séquences retenues.</p>
+        ${Array.isArray(classeSel && classeSel.sequencesChoisies) && classeSel.sequencesChoisies.length ? `<button class="btn btn-outline" id="seq-reset" style="margin-top:8px;">↺ Revenir à la pré-sélection</button>` : ""}
       </div>
 
       <div class="card no-print" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
@@ -42372,8 +42397,12 @@ EPS.ui.priority = {
         const cyc = EPS.state.cycleRef === "qualifiant" ? "qualifiant" : "college";
         const niv = EPS.state.niveauRef || "intermediaire";
         const li = (arr, cls) => `<ul class="pg-li ${cls || ""}">${(arr || []).map(x => `<li>${x}</li>`).join("")}</ul>`;
-        return `<div class="card">
-          <div class="card-title"><span class="tag ${i === 0 ? "tag-prio" : ""}">Séquence ${i + 1}</span> ${sq.principe}</div>
+        const pris = retenues.indexOf(sq.id);
+        return `<div class="card seq-carte" data-seq="${sq.id}" title="Cliquez pour retenir / retirer cette séquence"
+          style="cursor:pointer;${pris !== -1 ? "border:2px solid #2e7d4f;background:#f1faf4;" : "opacity:.85;"}">
+          <div class="card-title"><input type="checkbox" class="seq-choix" data-seq="${sq.id}" ${pris !== -1 ? "checked" : ""} style="width:18px;height:18px;margin-inline-end:8px;">
+            <span class="tag ${i === 0 ? "tag-prio" : ""}">Priorité ${i + 1}</span> ${sq.principe}
+            ${pris !== -1 ? `<span class="tag" style="background:#2e7d4f;color:#fff;margin-inline-start:6px;">Retenue n° ${pris + 1}</span>` : ""}</div>
           <div class="pg-grille">
             <div class="pg-col"><h5>Règles d'action = objectifs des séances</h5>
               <ol class="pg-li">${(sq.regles || []).map(r =>
@@ -42390,6 +42419,23 @@ EPS.ui.priority = {
       }).join("")}
       <button class="btn btn-success" onclick="goto('cycle')">Générer le projet de cycle →</button>
     `;
+
+    const basculer = async (id) => {
+      let l = EPS.sequencesRetenues(classeSel, apsRef).slice();
+      const r = l.indexOf(id);
+      if (r !== -1) { if (l.length === 1) { alert("Gardez au moins une séquence."); goto("priority"); return; } l.splice(r, 1); }
+      else { if (l.length >= 4) { alert("4 séquences au maximum."); goto("priority"); return; } l.push(id); }
+      classeSel.sequencesChoisies = l;
+      await EPS.db.put("classes", classeSel);
+      goto("priority");
+    };
+    container.querySelectorAll(".seq-carte").forEach(c => c.addEventListener("click", (e) => {
+      if (e.target.closest("button, select, a, input:not(.seq-choix)")) return;
+      e.preventDefault();
+      basculer(c.dataset.seq);
+    }));
+    const rz = document.getElementById("seq-reset");
+    if (rz) rz.addEventListener("click", async () => { delete classeSel.sequencesChoisies; await EPS.db.put("classes", classeSel); goto("priority"); });
 
     const sel = document.getElementById("sel-cycle-ref");
     if (sel) {
@@ -42676,10 +42722,15 @@ EPS.ui.cycle = {
         "TC": ["seq3", "seq2"], "1BAC": ["seq1", "seq3"], "2BAC": ["seq4", "seq3"]
       };
       const nivOtc = classe && classe.niveauScolaire, otcSeq = OTC_VITESSE[nivOtc] || null;
+      // séquences choisies dans « Priorisation » : elles seules construisent le cycle
+      const choisies = EPS.sequencesRetenues(classe, apsRef);
+      for (let q = weights.length - 1; q >= 0; q--) if (choisies.indexOf(weights[q].sequence.id) === -1) weights.splice(q, 1);
       if (otcSeq) weights.forEach(w => {
         const r = otcSeq.indexOf(w.sequence.id);
         w.weight = (w.weight || 1) * (r === 0 ? 2 : r === 1 ? 1.5 : 0.6);
       });
+      // séquences retenues par l'enseignant : répartition équilibrée (aucune ne descend sous la moitié de la plus forte)
+      if (weights.length) { const mx = Math.max(...weights.map(w => w.weight)); weights.forEach(w => { w.weight = Math.max(w.weight, mx * 0.5); }); }
       const built = EPS.engines.cycleGenerator.buildSessions(apsRef, weights, total);
 
       project = {
