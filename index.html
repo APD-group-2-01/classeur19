@@ -2148,6 +2148,16 @@ const JOURNAL_DEFAUT = {
       colNom = best;
     }
     if (colPrenom !== -1 && (colPrenom === colNom || scores[colPrenom].names === 0)) colPrenom = -1;
+    // Listes Massar : « الإسم » + « النسب » → une seule case « الإسم النسب »
+    if (headerRow) {
+      const exact = (c, mots) => { const t = normalizeForCompare(excelCellToText(headerRow[c])); return mots.some(m => t === normalizeForCompare(m)); };
+      let cPre = -1, cNom = -1;
+      for (let c = 0; c < nCols; c++) {
+        if (cPre === -1 && exact(c, ["الاسم", "الإسم", "الاسم الشخصي"])) cPre = c;
+        if (cNom === -1 && exact(c, ["النسب", "الاسم العائلي"])) cNom = c;
+      }
+      if (cPre !== -1 && cNom !== -1 && cPre !== cNom) { colNom = cPre; colPrenom = cNom; }
+    }
 
     // Sans en-tête : si la colonne voisine est elle aussi pleine de mots
     // (fichier « NOM | Prénom »), on la propose comme second champ.
@@ -15117,7 +15127,8 @@ window.XlsxLite = (function () {
     "الاسم", "اسم التلميذ", "اسم التلميذة", "الاسم والنسب", "الاسم الكامل", "النسب", "التلميذ", "اسم"];
   const MOTS_GENRE = ["genre", "sexe", "sex", "الجنس", "النوع"];
   const MOTS_IGNORE = ["code", "massar", "matricule", "date", "naissance", "note", "moyenne", "observation",
-    "رقم", "رقم التلميذ", "الرقم", "تاريخ", "تاريخ الازدياد", "النقطة", "نقطة", "الفرض", "ملاحظات", "المعدل", "القسم"];
+    "رقم", "رقم التلميذ", "الرقم", "تاريخ", "تاريخ الازدياد", "النقطة", "نقطة", "الفرض", "ملاحظات", "المعدل", "القسم",
+    "الرمز", "رمز", "مكان الازدياد", "الازدياد", "lieu"];
 
   function normaliser(s) {
     return (s || "").toString().toLowerCase()
@@ -15194,7 +15205,23 @@ window.XlsxLite = (function () {
       }
       colNom = best;
     }
-    return { lignes, debut, entete, nbCols, colNom, colGenre, scores };
+    // Listes Massar : « الإسم » (prénom) et « النسب » (nom) dans deux colonnes → une seule case « prénom nom ».
+    // Idem pour « Nom » / « Prénom » en français.
+    let colNom2 = -1;
+    if (entete) {
+      const exact = (c, mots) => { const t = normaliser(entete[c]); return mots.some(m => t === normaliser(m)); };
+      let cPre = -1, cNom = -1;
+      for (let c = 0; c < nbCols; c++) {
+        if (cPre === -1 && exact(c, ["الاسم", "الإسم", "الاسم الشخصي", "prenom", "prénom", "prenoms", "prénoms"])) cPre = c;
+        if (cNom === -1 && exact(c, ["النسب", "الاسم العائلي", "nom", "nom de famille"])) cNom = c;
+      }
+      if (cPre !== -1 && cNom !== -1 && cPre !== cNom) {
+        const arabe = /[\u0600-\u06FF]/.test(String(entete[cPre]) + String(entete[cNom]));
+        colNom = arabe ? cPre : cNom;          // arabe : الإسم puis النسب ; français : NOM puis Prénom
+        colNom2 = arabe ? cNom : cPre;
+      }
+    }
+    return { lignes, debut, entete, nbCols, colNom, colNom2, colNomAuto: colNom, colGenre, scores };
   }
 
   function libelleColonne(a, c) {
@@ -15257,12 +15284,13 @@ window.XlsxLite = (function () {
     for (let i = a.debut; i < a.lignes.length; i++) {
       const l = a.lignes[i] || [];
       if (scoreEntete(l) >= 2) continue;                 // en-têtes répétés
-      const nom = String(l[colNom] || "").trim();
+      let nom = String(l[colNom] || "").trim();
+      if (a.colNom2 >= 0 && colNom === a.colNomAuto) nom = (nom + " " + String(l[a.colNom2] || "").trim()).replace(/\s+/g, " ").trim();
       if (!nom || !ressembleNom(nom)) continue;
       let genre = null;
       if (colGenre >= 0) {
         const g = normaliser(l[colGenre]);
-        if (g) genre = /^(f|fille|feminin|female|انثى|أنثى|بنت)/.test(g) ? "F" : "M";
+        if (g) genre = /^(f|fille|feminin|female|انثى|انثي|بنت|انات)/.test(g) ? "F" : "M";
       }
       if (!genre) genre = devinerSexe(nom) || genreParDefaut || "M";   // colonne absente ou vide : d'après le prénom
       out.push({ nom, genre });
@@ -22390,7 +22418,8 @@ window.XlsxLite = (function () {
     "الاسم", "اسم التلميذ", "اسم التلميذة", "الاسم والنسب", "الاسم الكامل", "النسب", "التلميذ", "اسم"];
   const MOTS_GENRE = ["genre", "sexe", "sex", "الجنس", "النوع"];
   const MOTS_IGNORE = ["code", "massar", "matricule", "date", "naissance", "note", "moyenne", "observation",
-    "رقم", "رقم التلميذ", "الرقم", "تاريخ", "تاريخ الازدياد", "النقطة", "نقطة", "الفرض", "ملاحظات", "المعدل", "القسم"];
+    "رقم", "رقم التلميذ", "الرقم", "تاريخ", "تاريخ الازدياد", "النقطة", "نقطة", "الفرض", "ملاحظات", "المعدل", "القسم",
+    "الرمز", "رمز", "مكان الازدياد", "الازدياد", "lieu"];
 
   function normaliser(s) {
     return (s || "").toString().toLowerCase()
@@ -22467,7 +22496,23 @@ window.XlsxLite = (function () {
       }
       colNom = best;
     }
-    return { lignes, debut, entete, nbCols, colNom, colGenre, scores };
+    // Listes Massar : « الإسم » (prénom) et « النسب » (nom) dans deux colonnes → une seule case « prénom nom ».
+    // Idem pour « Nom » / « Prénom » en français.
+    let colNom2 = -1;
+    if (entete) {
+      const exact = (c, mots) => { const t = normaliser(entete[c]); return mots.some(m => t === normaliser(m)); };
+      let cPre = -1, cNom = -1;
+      for (let c = 0; c < nbCols; c++) {
+        if (cPre === -1 && exact(c, ["الاسم", "الإسم", "الاسم الشخصي", "prenom", "prénom", "prenoms", "prénoms"])) cPre = c;
+        if (cNom === -1 && exact(c, ["النسب", "الاسم العائلي", "nom", "nom de famille"])) cNom = c;
+      }
+      if (cPre !== -1 && cNom !== -1 && cPre !== cNom) {
+        const arabe = /[\u0600-\u06FF]/.test(String(entete[cPre]) + String(entete[cNom]));
+        colNom = arabe ? cPre : cNom;          // arabe : الإسم puis النسب ; français : NOM puis Prénom
+        colNom2 = arabe ? cNom : cPre;
+      }
+    }
+    return { lignes, debut, entete, nbCols, colNom, colNom2, colNomAuto: colNom, colGenre, scores };
   }
 
   function libelleColonne(a, c) {
@@ -22530,12 +22575,13 @@ window.XlsxLite = (function () {
     for (let i = a.debut; i < a.lignes.length; i++) {
       const l = a.lignes[i] || [];
       if (scoreEntete(l) >= 2) continue;                 // en-têtes répétés
-      const nom = String(l[colNom] || "").trim();
+      let nom = String(l[colNom] || "").trim();
+      if (a.colNom2 >= 0 && colNom === a.colNomAuto) nom = (nom + " " + String(l[a.colNom2] || "").trim()).replace(/\s+/g, " ").trim();
       if (!nom || !ressembleNom(nom)) continue;
       let genre = null;
       if (colGenre >= 0) {
         const g = normaliser(l[colGenre]);
-        if (g) genre = /^(f|fille|feminin|female|انثى|أنثى|بنت)/.test(g) ? "F" : "M";
+        if (g) genre = /^(f|fille|feminin|female|انثى|انثي|بنت|انات)/.test(g) ? "F" : "M";
       }
       if (!genre) genre = devinerSexe(nom) || genreParDefaut || "M";   // colonne absente ou vide : d'après le prénom
       out.push({ nom, genre });
@@ -29580,7 +29626,8 @@ window.XlsxLite = (function () {
     "الاسم", "اسم التلميذ", "اسم التلميذة", "الاسم والنسب", "الاسم الكامل", "النسب", "التلميذ", "اسم"];
   const MOTS_GENRE = ["genre", "sexe", "sex", "الجنس", "النوع"];
   const MOTS_IGNORE = ["code", "massar", "matricule", "date", "naissance", "note", "moyenne", "observation",
-    "رقم", "رقم التلميذ", "الرقم", "تاريخ", "تاريخ الازدياد", "النقطة", "نقطة", "الفرض", "ملاحظات", "المعدل", "القسم"];
+    "رقم", "رقم التلميذ", "الرقم", "تاريخ", "تاريخ الازدياد", "النقطة", "نقطة", "الفرض", "ملاحظات", "المعدل", "القسم",
+    "الرمز", "رمز", "مكان الازدياد", "الازدياد", "lieu"];
 
   function normaliser(s) {
     return (s || "").toString().toLowerCase()
@@ -29657,7 +29704,23 @@ window.XlsxLite = (function () {
       }
       colNom = best;
     }
-    return { lignes, debut, entete, nbCols, colNom, colGenre, scores };
+    // Listes Massar : « الإسم » (prénom) et « النسب » (nom) dans deux colonnes → une seule case « prénom nom ».
+    // Idem pour « Nom » / « Prénom » en français.
+    let colNom2 = -1;
+    if (entete) {
+      const exact = (c, mots) => { const t = normaliser(entete[c]); return mots.some(m => t === normaliser(m)); };
+      let cPre = -1, cNom = -1;
+      for (let c = 0; c < nbCols; c++) {
+        if (cPre === -1 && exact(c, ["الاسم", "الإسم", "الاسم الشخصي", "prenom", "prénom", "prenoms", "prénoms"])) cPre = c;
+        if (cNom === -1 && exact(c, ["النسب", "الاسم العائلي", "nom", "nom de famille"])) cNom = c;
+      }
+      if (cPre !== -1 && cNom !== -1 && cPre !== cNom) {
+        const arabe = /[\u0600-\u06FF]/.test(String(entete[cPre]) + String(entete[cNom]));
+        colNom = arabe ? cPre : cNom;          // arabe : الإسم puis النسب ; français : NOM puis Prénom
+        colNom2 = arabe ? cNom : cPre;
+      }
+    }
+    return { lignes, debut, entete, nbCols, colNom, colNom2, colNomAuto: colNom, colGenre, scores };
   }
 
   function libelleColonne(a, c) {
@@ -29720,12 +29783,13 @@ window.XlsxLite = (function () {
     for (let i = a.debut; i < a.lignes.length; i++) {
       const l = a.lignes[i] || [];
       if (scoreEntete(l) >= 2) continue;                 // en-têtes répétés
-      const nom = String(l[colNom] || "").trim();
+      let nom = String(l[colNom] || "").trim();
+      if (a.colNom2 >= 0 && colNom === a.colNomAuto) nom = (nom + " " + String(l[a.colNom2] || "").trim()).replace(/\s+/g, " ").trim();
       if (!nom || !ressembleNom(nom)) continue;
       let genre = null;
       if (colGenre >= 0) {
         const g = normaliser(l[colGenre]);
-        if (g) genre = /^(f|fille|feminin|female|انثى|أنثى|بنت)/.test(g) ? "F" : "M";
+        if (g) genre = /^(f|fille|feminin|female|انثى|انثي|بنت|انات)/.test(g) ? "F" : "M";
       }
       if (!genre) genre = devinerSexe(nom) || genreParDefaut || "M";   // colonne absente ou vide : d'après le prénom
       out.push({ nom, genre });
@@ -43803,7 +43867,8 @@ window.XlsxLite = (function () {
     "الاسم", "اسم التلميذ", "اسم التلميذة", "الاسم والنسب", "الاسم الكامل", "النسب", "التلميذ", "اسم"];
   const MOTS_GENRE = ["genre", "sexe", "sex", "الجنس", "النوع"];
   const MOTS_IGNORE = ["code", "massar", "matricule", "date", "naissance", "note", "moyenne", "observation",
-    "رقم", "رقم التلميذ", "الرقم", "تاريخ", "تاريخ الازدياد", "النقطة", "نقطة", "الفرض", "ملاحظات", "المعدل", "القسم"];
+    "رقم", "رقم التلميذ", "الرقم", "تاريخ", "تاريخ الازدياد", "النقطة", "نقطة", "الفرض", "ملاحظات", "المعدل", "القسم",
+    "الرمز", "رمز", "مكان الازدياد", "الازدياد", "lieu"];
 
   function normaliser(s) {
     return (s || "").toString().toLowerCase()
@@ -43880,7 +43945,23 @@ window.XlsxLite = (function () {
       }
       colNom = best;
     }
-    return { lignes, debut, entete, nbCols, colNom, colGenre, scores };
+    // Listes Massar : « الإسم » (prénom) et « النسب » (nom) dans deux colonnes → une seule case « prénom nom ».
+    // Idem pour « Nom » / « Prénom » en français.
+    let colNom2 = -1;
+    if (entete) {
+      const exact = (c, mots) => { const t = normaliser(entete[c]); return mots.some(m => t === normaliser(m)); };
+      let cPre = -1, cNom = -1;
+      for (let c = 0; c < nbCols; c++) {
+        if (cPre === -1 && exact(c, ["الاسم", "الإسم", "الاسم الشخصي", "prenom", "prénom", "prenoms", "prénoms"])) cPre = c;
+        if (cNom === -1 && exact(c, ["النسب", "الاسم العائلي", "nom", "nom de famille"])) cNom = c;
+      }
+      if (cPre !== -1 && cNom !== -1 && cPre !== cNom) {
+        const arabe = /[\u0600-\u06FF]/.test(String(entete[cPre]) + String(entete[cNom]));
+        colNom = arabe ? cPre : cNom;          // arabe : الإسم puis النسب ; français : NOM puis Prénom
+        colNom2 = arabe ? cNom : cPre;
+      }
+    }
+    return { lignes, debut, entete, nbCols, colNom, colNom2, colNomAuto: colNom, colGenre, scores };
   }
 
   function libelleColonne(a, c) {
@@ -43943,12 +44024,13 @@ window.XlsxLite = (function () {
     for (let i = a.debut; i < a.lignes.length; i++) {
       const l = a.lignes[i] || [];
       if (scoreEntete(l) >= 2) continue;                 // en-têtes répétés
-      const nom = String(l[colNom] || "").trim();
+      let nom = String(l[colNom] || "").trim();
+      if (a.colNom2 >= 0 && colNom === a.colNomAuto) nom = (nom + " " + String(l[a.colNom2] || "").trim()).replace(/\s+/g, " ").trim();
       if (!nom || !ressembleNom(nom)) continue;
       let genre = null;
       if (colGenre >= 0) {
         const g = normaliser(l[colGenre]);
-        if (g) genre = /^(f|fille|feminin|female|انثى|أنثى|بنت)/.test(g) ? "F" : "M";
+        if (g) genre = /^(f|fille|feminin|female|انثى|انثي|بنت|انات)/.test(g) ? "F" : "M";
       }
       if (!genre) genre = devinerSexe(nom) || genreParDefaut || "M";   // colonne absente ou vide : d'après le prénom
       out.push({ nom, genre });
@@ -48319,7 +48401,8 @@ window.XlsxLite = (function () {
     "الاسم", "اسم التلميذ", "اسم التلميذة", "الاسم والنسب", "الاسم الكامل", "النسب", "التلميذ", "اسم"];
   const MOTS_GENRE = ["genre", "sexe", "sex", "الجنس", "النوع"];
   const MOTS_IGNORE = ["code", "massar", "matricule", "date", "naissance", "note", "moyenne", "observation",
-    "رقم", "رقم التلميذ", "الرقم", "تاريخ", "تاريخ الازدياد", "النقطة", "نقطة", "الفرض", "ملاحظات", "المعدل", "القسم"];
+    "رقم", "رقم التلميذ", "الرقم", "تاريخ", "تاريخ الازدياد", "النقطة", "نقطة", "الفرض", "ملاحظات", "المعدل", "القسم",
+    "الرمز", "رمز", "مكان الازدياد", "الازدياد", "lieu"];
 
   function normaliser(s) {
     return (s || "").toString().toLowerCase()
@@ -48396,7 +48479,23 @@ window.XlsxLite = (function () {
       }
       colNom = best;
     }
-    return { lignes, debut, entete, nbCols, colNom, colGenre, scores };
+    // Listes Massar : « الإسم » (prénom) et « النسب » (nom) dans deux colonnes → une seule case « prénom nom ».
+    // Idem pour « Nom » / « Prénom » en français.
+    let colNom2 = -1;
+    if (entete) {
+      const exact = (c, mots) => { const t = normaliser(entete[c]); return mots.some(m => t === normaliser(m)); };
+      let cPre = -1, cNom = -1;
+      for (let c = 0; c < nbCols; c++) {
+        if (cPre === -1 && exact(c, ["الاسم", "الإسم", "الاسم الشخصي", "prenom", "prénom", "prenoms", "prénoms"])) cPre = c;
+        if (cNom === -1 && exact(c, ["النسب", "الاسم العائلي", "nom", "nom de famille"])) cNom = c;
+      }
+      if (cPre !== -1 && cNom !== -1 && cPre !== cNom) {
+        const arabe = /[\u0600-\u06FF]/.test(String(entete[cPre]) + String(entete[cNom]));
+        colNom = arabe ? cPre : cNom;          // arabe : الإسم puis النسب ; français : NOM puis Prénom
+        colNom2 = arabe ? cNom : cPre;
+      }
+    }
+    return { lignes, debut, entete, nbCols, colNom, colNom2, colNomAuto: colNom, colGenre, scores };
   }
 
   function libelleColonne(a, c) {
@@ -48459,12 +48558,13 @@ window.XlsxLite = (function () {
     for (let i = a.debut; i < a.lignes.length; i++) {
       const l = a.lignes[i] || [];
       if (scoreEntete(l) >= 2) continue;                 // en-têtes répétés
-      const nom = String(l[colNom] || "").trim();
+      let nom = String(l[colNom] || "").trim();
+      if (a.colNom2 >= 0 && colNom === a.colNomAuto) nom = (nom + " " + String(l[a.colNom2] || "").trim()).replace(/\s+/g, " ").trim();
       if (!nom || !ressembleNom(nom)) continue;
       let genre = null;
       if (colGenre >= 0) {
         const g = normaliser(l[colGenre]);
-        if (g) genre = /^(f|fille|feminin|female|انثى|أنثى|بنت)/.test(g) ? "F" : "M";
+        if (g) genre = /^(f|fille|feminin|female|انثى|انثي|بنت|انات)/.test(g) ? "F" : "M";
       }
       if (!genre) genre = devinerSexe(nom) || genreParDefaut || "M";   // colonne absente ou vide : d'après le prénom
       out.push({ nom, genre });
@@ -52898,7 +52998,8 @@ window.XlsxLite = (function () {
     "الاسم", "اسم التلميذ", "اسم التلميذة", "الاسم والنسب", "الاسم الكامل", "النسب", "التلميذ", "اسم"];
   const MOTS_GENRE = ["genre", "sexe", "sex", "الجنس", "النوع"];
   const MOTS_IGNORE = ["code", "massar", "matricule", "date", "naissance", "note", "moyenne", "observation",
-    "رقم", "رقم التلميذ", "الرقم", "تاريخ", "تاريخ الازدياد", "النقطة", "نقطة", "الفرض", "ملاحظات", "المعدل", "القسم"];
+    "رقم", "رقم التلميذ", "الرقم", "تاريخ", "تاريخ الازدياد", "النقطة", "نقطة", "الفرض", "ملاحظات", "المعدل", "القسم",
+    "الرمز", "رمز", "مكان الازدياد", "الازدياد", "lieu"];
 
   function normaliser(s) {
     return (s || "").toString().toLowerCase()
@@ -52975,7 +53076,23 @@ window.XlsxLite = (function () {
       }
       colNom = best;
     }
-    return { lignes, debut, entete, nbCols, colNom, colGenre, scores };
+    // Listes Massar : « الإسم » (prénom) et « النسب » (nom) dans deux colonnes → une seule case « prénom nom ».
+    // Idem pour « Nom » / « Prénom » en français.
+    let colNom2 = -1;
+    if (entete) {
+      const exact = (c, mots) => { const t = normaliser(entete[c]); return mots.some(m => t === normaliser(m)); };
+      let cPre = -1, cNom = -1;
+      for (let c = 0; c < nbCols; c++) {
+        if (cPre === -1 && exact(c, ["الاسم", "الإسم", "الاسم الشخصي", "prenom", "prénom", "prenoms", "prénoms"])) cPre = c;
+        if (cNom === -1 && exact(c, ["النسب", "الاسم العائلي", "nom", "nom de famille"])) cNom = c;
+      }
+      if (cPre !== -1 && cNom !== -1 && cPre !== cNom) {
+        const arabe = /[\u0600-\u06FF]/.test(String(entete[cPre]) + String(entete[cNom]));
+        colNom = arabe ? cPre : cNom;          // arabe : الإسم puis النسب ; français : NOM puis Prénom
+        colNom2 = arabe ? cNom : cPre;
+      }
+    }
+    return { lignes, debut, entete, nbCols, colNom, colNom2, colNomAuto: colNom, colGenre, scores };
   }
 
   function libelleColonne(a, c) {
@@ -53038,12 +53155,13 @@ window.XlsxLite = (function () {
     for (let i = a.debut; i < a.lignes.length; i++) {
       const l = a.lignes[i] || [];
       if (scoreEntete(l) >= 2) continue;                 // en-têtes répétés
-      const nom = String(l[colNom] || "").trim();
+      let nom = String(l[colNom] || "").trim();
+      if (a.colNom2 >= 0 && colNom === a.colNomAuto) nom = (nom + " " + String(l[a.colNom2] || "").trim()).replace(/\s+/g, " ").trim();
       if (!nom || !ressembleNom(nom)) continue;
       let genre = null;
       if (colGenre >= 0) {
         const g = normaliser(l[colGenre]);
-        if (g) genre = /^(f|fille|feminin|female|انثى|أنثى|بنت)/.test(g) ? "F" : "M";
+        if (g) genre = /^(f|fille|feminin|female|انثى|انثي|بنت|انات)/.test(g) ? "F" : "M";
       }
       if (!genre) genre = devinerSexe(nom) || genreParDefaut || "M";   // colonne absente ou vide : d'après le prénom
       out.push({ nom, genre });
