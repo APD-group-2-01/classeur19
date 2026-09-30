@@ -9707,6 +9707,7 @@ table.seances .c-date input{font-size:8pt;background-image:none;padding:0;}
   <span class="sp"></span>
   <button class="b" id="b-sync" title="Reprendre les séances validées dans les projets de cycle">⟳ Synchroniser</button>
   <button class="b" id="b-csv">⬇ Exporter CSV</button>
+  <button class="b" id="b-vider" style="color:#b3261e;border-color:#f0c7c7;" title="Efface toutes les séances ajoutées pour l'année affichée">🗑 Tout supprimer</button>
   <button class="b prim" id="b-print">🖨 Imprimer / PDF</button>
 </div>
 <nav class="sommaire no-print" id="sommaire"></nav>
@@ -10111,6 +10112,23 @@ table.seances .c-date input{font-size:8pt;background-image:none;padding:0;}
     alert(n ? n + " séance(s) ajoutée(s) depuis les projets de cycle." : "Aucune nouvelle séance validée à ajouter.");
   };
   $("b-print").onclick = () => window.print();
+  $("b-vider").onclick = () => {
+    const annee = $("sel-annee").value;
+    const x = A(annee);
+    const nb = APS.reduce((s, p) => s + x.aps[p.id].lignes.filter(l => l.classe || l.date || l.objectif || l.remarque).length, 0);
+    const entrees = window.RegistreEPS ? RegistreEPS.lire(annee) : [];
+    if (!nb && !entrees.length) { alert("Le cahier de textes " + annee + " est déjà vide."); return; }
+    const ok = () => {
+      APS.forEach(p => { x.aps[p.id] = { du: "", au: "", lignes: [] }; });
+      if (window.RegistreEPS) entrees.forEach(e => RegistreEPS.supprimer(e.id, annee));
+      sauver(); rendre();
+      alert("Cahier de textes " + annee + " vidé : " + nb + " ligne(s) supprimée(s). Les séances correspondantes redeviennent « À faire » dans les projets de cycle.");
+    };
+    const msg = "Supprimer TOUT ce qui a été ajouté dans le cahier de textes " + annee + " (" + nb + " ligne(s), " + entrees.length +
+      " séance(s) validée(s)) ? Les séances redeviendront « À faire » dans les projets de cycle. Cette action est définitive.";
+    if (window.RegistreEPS && RegistreEPS.confirmer) RegistreEPS.confirmer(msg, "Tout supprimer").then(r => { if (r) ok(); });
+    else if (confirm(msg)) ok();
+  };
   $("b-csv").onclick = () => {
     const x = A();
     const lignes = [["APS", "Séance", "Classe", "Date", "Objectif / Travail réalisé", "Remarque et signature"]];
@@ -40538,6 +40556,42 @@ ul.pg-li.pg-ok li::before{content:"\2713 ";color:#2E8B57;font-weight:700;}
 .pg-obj{color:#78828E;font-size:.78rem;}
 .pg-p{display:inline-block;width:8px;height:8px;border-radius:50%;margin-inline-end:6px;}
 .pg-r{background:#C0392B;} .pg-o{background:#D2761B;} .pg-v{background:#2E8B57;}
+/* ── Présentation alignée sur les applications basket / hand / volley ── */
+:root {
+  --bleu: #A3322B;          /* rouge piste : couleur de l'APS */
+  --bleuM: #C0452F;
+  --bleuCl: #FBECE8;
+  --or: #E8952A;            /* ambre commun aux APS */
+  --orCl: #FFF4E0;
+  --gris1: #F1F4F8;
+  --gris2: #DCE3EC;
+  --radius: 13px;
+  --shadow: 0 1px 2px rgba(20,73,123,.08);
+  --font-serif: system-ui, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+body { background: var(--gris1); }
+.sidebar { width: 246px; }
+.brand { padding: 20px 18px 16px; border-bottom-color: rgba(255,255,255,.12); }
+.brand-badge { background: var(--or); color: #3A2A05; font-size: .7rem; letter-spacing: .12em; text-transform: uppercase; padding: 3px 10px; }
+.brand-title { font-size: 1.15rem; margin-top: 2px; }
+.brand-sub { color: #F2D3CD; font-size: .78rem; }
+.nav { padding: 10px 10px 16px; }
+.nav-item { color: #F6DEDA; font-weight: 500; font-size: .93rem; padding: 10px 12px; }
+.nav-item:hover { background: rgba(255,255,255,.09); color: #fff; }
+.nav-item.active { background: var(--or); color: #3A2A05; font-weight: 700; }
+.sidebar-footer { border-top-color: rgba(255,255,255,.12); }
+.classe-select-label { color: #F2D3CD; }
+.topbar { padding: 11px 20px; }
+.topbar-title { font-size: 1.3rem; }
+.view { padding: 22px 20px 60px; max-width: 1180px; }
+.card { border-radius: var(--radius); padding: 17px 18px; margin-bottom: 16px; box-shadow: var(--shadow); border-color: var(--gris2); }
+.card-title { color: var(--texte); border-bottom: 0; padding-bottom: 0; margin-bottom: 12px; font-size: 1rem; }
+.btn { border-radius: 9px; padding: 8px 14px; font-size: .9rem; }
+.btn-sm { padding: 5px 10px; font-size: .83rem; }
+.btn-primary { background: var(--bleu); }
+.btn-primary:hover { background: #7E231E; }
+.data-table th { text-transform: uppercase; letter-spacing: .09em; font-size: .75rem; }
+.data-table tr:hover td { background: #F7FAFD; }
 </style>
 </head>
 <body>
@@ -40545,7 +40599,7 @@ ul.pg-li.pg-ok li::before{content:"\2713 ";color:#2E8B57;font-weight:700;}
 <!-- ============================================================
      PAGE D'ACCUEIL (HERO)
      ============================================================ -->
-<div class="hero-page" id="landingPage">
+<div class="hero-page" id="landingPage" style="display:none;">
 
   <div class="hero-topbar">
     <div class="hero-brand">
@@ -40607,13 +40661,13 @@ ul.pg-li.pg-ok li::before{content:"\2713 ";color:#2E8B57;font-weight:700;}
 <!-- ============================================================
      APPLICATION (masquée au départ)
      ============================================================ -->
-<div class="app-shell" id="appShell" style="display:none;">
+<div class="app-shell" id="appShell" style="display:flex;">
 
   <aside class="sidebar" id="sidebar">
-    <a href="#" class="brand" style="text-decoration:none;color:inherit;display:block;" onclick="showLanding();return false;">
-      <div class="brand-badge">⚡ APD 2026</div>
-      <div class="brand-title">Classeur EPS</div>
-      <div class="brand-sub">Diagnostic &amp; Cycle</div>
+    <a href="#" class="brand" style="text-decoration:none;color:inherit;display:block;" onclick="showApp('dashboard');return false;">
+      <div class="brand-badge">Course de vitesse</div>
+      <div class="brand-title">Vitesse Didactic</div>
+      <div class="brand-sub">Diagnostic • Analyse • Projet de cycle</div>
     </a>
     <nav class="nav" id="navMenu">
       <button class="nav-item" data-view="dashboard">🏠 Dashboard</button>
@@ -43504,7 +43558,7 @@ EPS.ui.settings = {
       <div class="card">
         <div class="card-title">Répartition du qualitatif (note procédurale sommative)</div>
         <p class="hint">Note procédurale = Performance /${EPS.reference.performanceMax} + Qualitatif (Réaction + Foulée + Ralentissement). Pour chaque niveau, la somme des 3 doit être égale au maximum qualitatif du niveau.</p>
-        ${Object.entries(EPS.reference.niveaux).map(([code, cfg]) => {
+        ${Object.entries(EPS.reference.niveaux).filter(([code, cfg]) => cfg && cfg.qualitatifRepartition).map(([code, cfg]) => {
           const rep = cfg.qualitatifRepartition;
           return `<div class="form-row" data-niveau-rep="${code}" style="align-items:center;border-top:1px solid var(--gris2);padding-top:12px;margin-top:8px;">
             <div class="form-group" style="flex:0 0 90px;"><label>Niveau</label><div style="font-weight:800;">${code}</div></div>
@@ -43514,6 +43568,7 @@ EPS.ui.settings = {
             <div class="form-group" style="flex:0 0 130px;"><label>Total requis</label><div style="font-weight:800;color:var(--bleuM);">/${cfg.qualitatifMax}</div></div>
           </div>`;
         }).join("")}
+        ${Object.entries(EPS.reference.niveaux).some(([c, cfg]) => cfg && !cfg.qualitatifRepartition) ? `<p class="hint" style="margin-top:10px;">Lycée (${Object.entries(EPS.reference.niveaux).filter(([c, cfg]) => cfg && !cfg.qualitatifRepartition).map(([c]) => c).join(", ")}) : le qualitatif est une note unique (السلوك الحركي), sans répartition à régler.</p>` : ""}
         <button class="btn btn-primary" id="btnSaveRepartition" style="margin-top:14px;">💾 Enregistrer la répartition</button>
       </div>
 
@@ -43814,10 +43869,7 @@ function showApp(view) {
   document.getElementById("appShell").style.display = "flex";
   if (window.renderView) renderView(view || "dashboard");
 }
-function showLanding() {
-  document.getElementById("appShell").style.display = "none";
-  document.getElementById("landingPage").style.display = "block";
-}
+function showLanding() { showApp("dashboard"); }   // la page d'accueil n'est plus utilisée
 @@SCRIPTCLOSE7f3a@@>
 
 <style>
