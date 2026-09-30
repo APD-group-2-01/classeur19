@@ -42126,7 +42126,7 @@ EPS.ui.diagnostic = {
             ${students.map((s) => {
               const r = resultsByStudent[s.id] || {};
               return `<tr>
-                <td>${s.nom}</td>
+                <td>${s.nom}<br><span class="tag ${s.genre === "F" ? "tag-orange" : "tag-gray"}" style="font-size:.7rem;">${s.genre === "F" ? "Fille · " + distF + " m" : "Garçon · " + distG + " m"}</span></td>
                 ${apsRef.observables.map((o) => {
                   if (o.type === "oui_non") {
                     return `<td>
@@ -42200,7 +42200,7 @@ EPS.ui.diagnostic = {
     container.querySelectorAll(".temps-input").forEach((inp) => {
       inp.addEventListener("change", async () => {
         const studentId = inp.dataset.student;
-        const stu = students.find((x) => x.id === studentId);
+        const stu = (await EPS.db.get("students", studentId)) || students.find((x) => x.id === studentId);
         const raw = inp.value.trim().replace(",", ".");
         const temps = raw === "" ? null : parseFloat(raw);
         const statut = EPS.engines.notation.performanceStatut(
@@ -42743,6 +42743,17 @@ EPS.ui.cycle = {
       EPS.saveIndicator();
       goto("cycle");
     });
+
+    if (project && !EPS._regenAuto) {
+      const choisies = EPS.sequencesRetenues(classe, apsRef);
+      const presentes = [...new Set((project.sessions || []).filter(s => s.sequenceId).map(s => s.sequenceId))];
+      if (choisies.length !== presentes.length || choisies.some(id => presentes.indexOf(id) === -1)) {
+        EPS._regenAuto = true;
+        setTimeout(() => { EPS._regenAuto = false; }, 3000);
+        document.getElementById("btnGenerate").click();
+        return;
+      }
+    }
 
     if (!project) return;
 
@@ -43653,6 +43664,43 @@ EPS.saveIndicator = function () {
   EPS._saveTimer = setTimeout(() => el.classList.remove("show"), 1400);
 };
 
+/* Recalcule, pour une classe :
+   - le sexe des élèves d'après le prénom (fille reconnue mais enregistrée « garçon », sauf choix manuel) ;
+   - le niveau (lacune / intermédiaire / maîtrise) de chaque temps du diagnostic, avec le barème
+     du sexe (garçons 80 m, filles 60 m) et du niveau scolaire actuels — il n'est plus figé à la saisie. */
+EPS.recalculerStatuts = async function (classeId) {
+  const classe = await EPS.db.get("classes", classeId);
+  if (!classe) return;
+  const niv = classe.niveauScolaire || "1AC";
+  const eleves = await EPS.db.getByIndex("students", "classeId", classeId);
+  for (const st of eleves) {
+    if (st.genreManuel || st.genre === "F") continue;
+    if (window.XlsxLite && XlsxLite.devinerSexe(st.nom) === "F") { st.genre = "F"; await EPS.db.put("students", st); }
+  }
+  const parId = {}; eleves.forEach(e => { parId[e.id] = e; });
+  const apsRef = EPS.reference.aps[EPS.state.apsId];
+  if (!apsRef) return;
+  const obsT = apsRef.observables.filter(o => o.type === "temps");
+  const sRow = await EPS.db.get("settings", "seuils");
+  const seuils = sRow ? sRow.value : EPS.reference.seuils;
+  const sessions = await EPS.db.getByIndex("diagnostic_sessions", "classeId", classeId);
+  for (const s of sessions) {
+    const res = await EPS.engines.diagnostic.getResultsForSession(s.id);
+    for (const r of res) {
+      const st = parId[r.studentId];
+      if (!st) continue;
+      const o = r.observables || {};
+      let change = false;
+      obsT.forEach(ob => {
+        const t = parseFloat(String(o[ob.id]).replace(",", "."));
+        const nv = (!isNaN(t) && t > 0) ? (EPS.engines.notation.performanceStatut(t, st.genre || "M", niv, EPS.state.apsId, null, seuils) || "") : "";
+        if ((o[ob.id + "_statut"] || "") !== nv) { o[ob.id + "_statut"] = nv; change = true; }
+      });
+      if (change) { r.observables = o; await EPS.db.put("diagnostic_results", r); }
+    }
+  }
+};
+
 EPS.setClasse = function (id) {
   EPS.state.classeId = id;
   localStorage.setItem("eps_classeur_active_classe", id || "");
@@ -43674,6 +43722,10 @@ async function renderView(name) {
 
   EPS.state.view = name;
   document.getElementById("viewTitle").textContent = VIEW_TITLES[name] || name;
+  // sexe d'après le prénom + niveaux de performance recalculés avec le sexe et le niveau actuels
+  if (EPS.state.classeId && ["classes", "diagnostic", "analysis", "priority", "cycle", "dashboard"].includes(name)) {
+    try { await EPS.recalculerStatuts(EPS.state.classeId); } catch (e) { console.warn(e); }
+  }
   document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
 
   const container = document.getElementById("view");
